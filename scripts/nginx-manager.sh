@@ -147,8 +147,8 @@ reset_internal_state() {
 	unset CURRENT_TMP VALIDATION_DIR TRANSACTION_ACTIVE ROLLBACK_DONE BACKUP_DIR MANIFEST \
 		PORT_CHECKER MODE DOMAIN CERT_FILE KEY_FILE HTTP_PORT HTTPS_PORT \
 		TLS_INTERNAL_PORT BACKEND_PORT TLS_PASSTHROUGH SITE_CONFIG STREAM_CONFIG \
-		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET LOCATION_FRAGMENT WS_MAP_VAR \
-		PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
+		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET LOCATION_FRAGMENT UPSTREAM_FRAGMENT \
+		WS_MAP_VAR PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
 		IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING MANAGED_INSTALLED_AT \
 		MANAGED_LAST_CONFIGURED_AT
 }
@@ -2005,6 +2005,140 @@ append_common_proxy_headers() {
 	unset acph_fragment acph_forwarded_port acph_timeout
 }
 
+extract_proxy_upstreams() {
+	enpu_source=$1
+
+	awk '
+		{
+			remainder = $0
+			while (match(remainder, /proxy_pass[[:space:]]+https?:\/\/[^;[:space:]]+/)) {
+				value = substr(remainder, RSTART, RLENGTH)
+				sub(/^proxy_pass[[:space:]]+https?:\/\//, "", value)
+				sub(/\/.*/, "", value)
+
+				if (value ~ /^[A-Za-z_][A-Za-z0-9_-]*$/ && value != "localhost") {
+					print value
+				}
+
+				remainder = substr(remainder, RSTART + RLENGTH)
+			}
+		}
+	' "$enpu_source" | awk '!seen[$0]++'
+
+	unset enpu_source
+}
+
+upstream_defined_elsewhere() {
+	ude_name=$1
+	ude_excluded_target=$2
+
+	ude_match=$(find "$NGINX_CONF_DIR" -type f \
+		! -path "$NGINX_CONF_DIR/backups/*" \
+		! -path "$ude_excluded_target" \
+		-exec awk -v wanted="$ude_name" '
+			/^[[:space:]]*upstream[[:space:]]+/ {
+				value = $0
+				sub(/^[[:space:]]*upstream[[:space:]]+/, "", value)
+				sub(/[[:space:]]*\{.*/, "", value)
+				if (value == wanted) {
+					print FILENAME
+					exit
+				}
+			}
+		' {} \; 2> /dev/null | sed -n '1p')
+
+	if [ -n "$ude_match" ]; then
+		log_success "Named upstream $ude_name is already defined in $ude_match"
+		unset ude_name ude_excluded_target ude_match
+		return 0
+	fi
+
+	unset ude_name ude_excluded_target ude_match
+	return 1
+}
+
+normalize_upstream_server() {
+	nus_value=$1
+	nus_value=$(printf '%s\n' "$nus_value" \
+		| sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^server[[:space:]][[:space:]]*//; s/;[[:space:]]*$//')
+
+	case $nus_value in
+		'' | *'{'* | *'}'* | *';'*)
+			unset nus_value
+			return 1
+			;;
+	esac
+
+	NORMALIZED_UPSTREAM_SERVER=$nus_value
+	unset nus_value
+	return 0
+}
+
+collect_required_upstreams() {
+	cru_locations=$1
+	cru_target=$2
+	UPSTREAM_FRAGMENT="$BACKUP_DIR/http-upstreams.conf"
+	cru_names="$BACKUP_DIR/proxy-pass-upstreams.txt"
+
+	: > "$UPSTREAM_FRAGMENT" \
+		|| fatal "Could not create the HTTP-upstream workspace."
+	chmod 0600 "$UPSTREAM_FRAGMENT" \
+		|| fatal "Could not secure the HTTP-upstream workspace."
+
+	extract_proxy_upstreams "$cru_locations" > "$cru_names" \
+		|| fatal "Could not inspect custom proxy_pass directives for named upstreams."
+	chmod 0600 "$cru_names" \
+		|| fatal "Could not secure the named-upstream inventory."
+
+	if [ ! -s "$cru_names" ]; then
+		rm -f "$cru_names"
+		unset cru_locations cru_target cru_names
+		return 0
+	fi
+
+	while IFS= read -r cru_name <&3; do
+		[ -n "$cru_name" ] || continue
+
+		if upstream_defined_elsewhere "$cru_name" "$cru_target"; then
+			continue
+		fi
+
+		log_warn "Custom proxy_pass references named upstream '$cru_name', but no matching HTTP-level upstream block will remain after replacing $cru_target."
+		log_info "A named proxy_pass target must be declared outside all server and location blocks."
+
+		while :; do
+			printf "Backend server for upstream %s (for example 127.0.0.1:8080): " "$cru_name"
+			if ! IFS= read -r cru_server; then
+				fatal "Input ended before a server was provided for upstream $cru_name."
+			fi
+
+			if normalize_upstream_server "$cru_server"; then
+				cru_server=$NORMALIZED_UPSTREAM_SERVER
+				unset NORMALIZED_UPSTREAM_SERVER
+				break
+			fi
+
+			log_warn "Enter one Nginx upstream server value without braces or embedded semicolons, such as 127.0.0.1:8080."
+		done
+
+		cat >> "$UPSTREAM_FRAGMENT" <<- HTTP_UPSTREAM
+			# Managed HTTP upstream inferred from custom proxy_pass directives.
+			# UPSTREAM: $cru_name
+			upstream $cru_name {
+			    server $cru_server;
+			}
+
+		HTTP_UPSTREAM
+
+		log_success "Added HTTP upstream $cru_name -> $cru_server"
+		unset cru_name cru_server
+	done 3< "$cru_names"
+
+	rm -f "$cru_names"
+	unset cru_locations cru_target cru_names
+	return 0
+}
+
 collect_custom_parameters() {
 	ccp_output=$1
 
@@ -2308,9 +2442,15 @@ write_https_site_config() {
 	whsc_listen=$1
 	whsc_target=$2
 
+	collect_required_upstreams "$LOCATION_FRAGMENT" "$whsc_target"
 	make_temp_for "$whsc_target"
 
-	cat > "$CURRENT_TMP" <<- HTTPS_HEADER
+	if [ -s "$UPSTREAM_FRAGMENT" ]; then
+		cat "$UPSTREAM_FRAGMENT" >> "$CURRENT_TMP" \
+			|| fatal "Could not append generated HTTP upstream blocks to $whsc_target."
+	fi
+
+	cat >> "$CURRENT_TMP" <<- HTTPS_HEADER
 		# Managed HTTPS reverse-proxy virtual host for $DOMAIN.
 		# Host validation is intentionally strict.
 
@@ -2362,9 +2502,16 @@ write_https_site_config() {
 
 write_custom_config() {
 	wcmc_target=$1
+
+	collect_required_upstreams "$LOCATION_FRAGMENT" "$wcmc_target"
 	make_temp_for "$wcmc_target"
 
-	cat > "$CURRENT_TMP" <<- CUSTOM_CONFIG
+	if [ -s "$UPSTREAM_FRAGMENT" ]; then
+		cat "$UPSTREAM_FRAGMENT" >> "$CURRENT_TMP" \
+			|| fatal "Could not append generated HTTP upstream blocks to $wcmc_target."
+	fi
+
+	cat >> "$CURRENT_TMP" <<- CUSTOM_CONFIG
 		# Managed custom-port HTTP/HTTPS reverse proxy for $DOMAIN.
 		# This file does not alter public port-80 or port-443 routing.
 
@@ -2472,7 +2619,7 @@ configure_domain_mode() {
 		unset cdm_token cdm_target cdm_listen
 	fi
 
-	unset WS_MAP_VAR LOCATION_FRAGMENT
+	unset WS_MAP_VAR LOCATION_FRAGMENT UPSTREAM_FRAGMENT
 }
 
 configure_custom_port_mode() {
@@ -2517,7 +2664,7 @@ configure_custom_port_mode() {
 		done
 
 		log_success "The custom-port HTTP/HTTPS configuration passed validation and was installed."
-		unset ccpm_token ccpm_target WS_MAP_VAR LOCATION_FRAGMENT
+		unset ccpm_token ccpm_target WS_MAP_VAR LOCATION_FRAGMENT UPSTREAM_FRAGMENT
 	else
 		TLS_PASSTHROUGH=1
 		prompt_raw_tls_backend_port
