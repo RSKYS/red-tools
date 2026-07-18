@@ -2,7 +2,7 @@
 SHELL := /bin/sh
 
 BIN_PATH := /usr/sbin
-TARGET := scripts/*.sh
+SCRIPT_DIR := scripts
 
 .PHONY: all build install uninstall clean
 
@@ -13,15 +13,19 @@ build:
 
 install: build
 	@install -d "$(DESTDIR)$(BIN_PATH)"
-	for script in $(TARGET); do
+	for script in $(SCRIPT_DIR)/*; do
 		[ -f "$$script" ] || continue
-		install -m 755 "$$script" "$(DESTDIR)$(BIN_PATH)/$$(basename "$$script")"
+		name=$${script##*/}
+		name=$${name%.*}
+		install -m 755 "$$script" "$(DESTDIR)$(BIN_PATH)/$$name"
 	done
 
 uninstall:
-	@for script in $(TARGET); do
+	@for script in $(SCRIPT_DIR)/*; do
 		[ -f "$$script" ] || continue
-		rm -f "$(DESTDIR)$(BIN_PATH)/$$(basename "$$script")"
+		name=$${script##*/}
+		name=$${name%.*}
+		rm -f "$(DESTDIR)$(BIN_PATH)/$$name"
 	done
 
 clean:

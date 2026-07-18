@@ -1,103 +1,168 @@
 name: Attach .deb release asset
 
 on:
-push:
-tags:
-- "v*"
+  push:
+    tags:
+      - "v*"
 
 permissions:
-contents: write
+  contents: write
 
 jobs:
-release-deb:
-name: Build and upload .deb
-runs-on: ubuntu-latest
+  release-deb:
+    name: Build and upload .deb
+    runs-on: ubuntu-latest
 
-steps:
-  - name: Check out release tag
-    uses: actions/checkout@v7
-    with:
-      ref: ${{ github.ref_name }}
-      fetch-depth: 0
-      persist-credentials: false
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
 
-  - name: Install packaging dependencies
-    run: |
-      sudo apt-get update
-      sudo apt-get install --yes --no-install-recommends \
-        build-essential \
-        dpkg-dev \
-        fakeroot
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            make \
+            dpkg-dev
 
-  - name: Extract version from tag
-    run: |
-      set -Eeuo pipefail
+      - name: Derive and validate package metadata
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-      tag="${GITHUB_REF_NAME}"
-      version="${tag#v}"
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
 
-      if [ -z "$version" ] || [ "$version" = "$tag" ]; then
-        printf 'Invalid release tag: %s\n' "$tag" >&2
-        exit 1
-      fi
+          if [[ -z "$version" || "$version" == "$tag" ]]; then
+            printf 'Invalid release tag: %s\n' "$tag" >&2
+            exit 1
+          fi
 
-      {
-        printf 'RELEASE_TAG=%s\n' "$tag"
-        printf 'PACKAGE_VERSION=%s\n' "$version"
-      } >> "$GITHUB_ENV"
+          if ! dpkg --validate-version "$version"; then
+            printf 'Tag does not contain a valid Debian version: %s\n' "$version" >&2
+            exit 1
+          fi
 
-  - name: Build Debian package
-    run: |
-      set -Eeuo pipefail
+          repository_name="${GITHUB_REPOSITORY##*/}"
+          package_name="$(
+            printf '%s' "$repository_name" |
+              tr '[:upper:]_' '[:lower:]-' |
+              sed -E 's/[^a-z0-9+.-]+/-/g; s/^[^a-z0-9]+//; s/[^a-z0-9]+$//'
+          )"
 
-      make clean
-      make build VERSION="$PACKAGE_VERSION"
-      make package VERSION="$PACKAGE_VERSION"
+          if [[ -z "$package_name" ]] || ! dpkg --validate-pkgname "$package_name"; then
+            printf 'Cannot derive a valid Debian package name from repository: %s\n' \
+              "$repository_name" >&2
+            exit 1
+          fi
 
-  - name: Find and validate Debian package
-    run: |
-      set -Eeuo pipefail
+          {
+            printf 'RELEASE_TAG=%s\n' "$tag"
+            printf 'PACKAGE_VERSION=%s\n' "$version"
+            printf 'PACKAGE_NAME=%s\n' "$package_name"
+          } >> "$GITHUB_ENV"
 
-      mapfile -d '' packages < <(
-        find "$GITHUB_WORKSPACE" \
-          -type f \
-          -name '*.deb' \
-          -print0
-      )
+      - name: Build Debian package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
 
-      if [ "${#packages[@]}" -ne 1 ]; then
-        printf 'Expected exactly one .deb package, found %s\n' \
-          "${#packages[@]}" >&2
-        printf '%s\n' "${packages[@]}" >&2
-        exit 1
-      fi
+          package_root="${RUNNER_TEMP}/package-root"
+          output_dir="${GITHUB_WORKSPACE}/dist"
 
-      package="${packages[0]}"
-      dpkg-deb --info "$package" >/dev/null
+          rm -rf "$package_root" "$output_dir"
+          mkdir -p "$package_root/DEBIAN" "$output_dir"
 
-      printf 'DEB_PACKAGE=%s\n' "$package" >> "$GITHUB_ENV"
+          make clean
+          make install DESTDIR="$package_root"
 
-  - name: Create GitHub release
-    env:
-      GH_TOKEN: ${{ github.token }}
-    run: |
-      set -Eeuo pipefail
+          mapfile -d '' installed_files < <(
+            find "$package_root/usr/sbin" \
+              -mindepth 1 \
+              -maxdepth 1 \
+              -type f \
+              -print0
+          )
 
-      if ! gh release view "$RELEASE_TAG" \
-        --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-        gh release create "$RELEASE_TAG" \
-          --repo "$GITHUB_REPOSITORY" \
-          --verify-tag \
-          --generate-notes \
-          --title "$RELEASE_TAG"
-      fi
+          if [[ "${#installed_files[@]}" -eq 0 ]]; then
+            printf 'No files were installed from scripts/.\n' >&2
+            exit 1
+          fi
 
-  - name: Upload Debian package
-    env:
-      GH_TOKEN: ${{ github.token }}
-    run: |
-      set -Eeuo pipefail
+          installed_size="$(
+            du -sk "$package_root/usr" |
+              awk '{print $1}'
+          )"
 
-      gh release upload "$RELEASE_TAG" "$DEB_PACKAGE" \
-        --repo "$GITHUB_REPOSITORY" \
-        --clobber
+          cat > "$package_root/DEBIAN/control" <<EOF
+          Package: $PACKAGE_NAME
+          Version: $PACKAGE_VERSION
+          Section: utils
+          Priority: optional
+          Architecture: all
+          Maintainer: GitHub Actions <noreply@github.com>
+          Installed-Size: $installed_size
+          Homepage: https://github.com/$GITHUB_REPOSITORY
+          Description: Command-line scripts from $GITHUB_REPOSITORY
+          EOF
+
+          package="${output_dir}/${PACKAGE_NAME}_${PACKAGE_VERSION}_all.deb"
+
+          dpkg-deb \
+            --root-owner-group \
+            --build "$package_root" "$package"
+
+      - name: Find and validate Debian package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mapfile -d '' packages < <(
+            find "$GITHUB_WORKSPACE/dist" \
+              -maxdepth 1 \
+              -type f \
+              -name '*.deb' \
+              -print0
+          )
+
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            printf 'Expected exactly one .deb package, found %s\n' \
+              "${#packages[@]}" >&2
+            printf '%s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+
+          package="${packages[0]}"
+
+          dpkg-deb --info "$package" >/dev/null
+          dpkg-deb --contents "$package"
+
+          printf 'DEB_PACKAGE=%s\n' "$package" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          if ! gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi
+
+      - name: Upload Debian package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          gh release upload "$RELEASE_TAG" "$DEB_PACKAGE" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
