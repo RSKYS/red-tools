@@ -1,0 +1,103 @@
+name: Attach .deb release asset
+
+on:
+push:
+tags:
+- "v*"
+
+permissions:
+contents: write
+
+jobs:
+release-deb:
+name: Build and upload .deb
+runs-on: ubuntu-latest
+
+steps:
+  - name: Check out release tag
+    uses: actions/checkout@v7
+    with:
+      ref: ${{ github.ref_name }}
+      fetch-depth: 0
+      persist-credentials: false
+
+  - name: Install packaging dependencies
+    run: |
+      sudo apt-get update
+      sudo apt-get install --yes --no-install-recommends \
+        build-essential \
+        dpkg-dev \
+        fakeroot
+
+  - name: Extract version from tag
+    run: |
+      set -Eeuo pipefail
+
+      tag="${GITHUB_REF_NAME}"
+      version="${tag#v}"
+
+      if [ -z "$version" ] || [ "$version" = "$tag" ]; then
+        printf 'Invalid release tag: %s\n' "$tag" >&2
+        exit 1
+      fi
+
+      {
+        printf 'RELEASE_TAG=%s\n' "$tag"
+        printf 'PACKAGE_VERSION=%s\n' "$version"
+      } >> "$GITHUB_ENV"
+
+  - name: Build Debian package
+    run: |
+      set -Eeuo pipefail
+
+      make clean
+      make build VERSION="$PACKAGE_VERSION"
+      make package VERSION="$PACKAGE_VERSION"
+
+  - name: Find and validate Debian package
+    run: |
+      set -Eeuo pipefail
+
+      mapfile -d '' packages < <(
+        find "$GITHUB_WORKSPACE" \
+          -type f \
+          -name '*.deb' \
+          -print0
+      )
+
+      if [ "${#packages[@]}" -ne 1 ]; then
+        printf 'Expected exactly one .deb package, found %s\n' \
+          "${#packages[@]}" >&2
+        printf '%s\n' "${packages[@]}" >&2
+        exit 1
+      fi
+
+      package="${packages[0]}"
+      dpkg-deb --info "$package" >/dev/null
+
+      printf 'DEB_PACKAGE=%s\n' "$package" >> "$GITHUB_ENV"
+
+  - name: Create GitHub release
+    env:
+      GH_TOKEN: ${{ github.token }}
+    run: |
+      set -Eeuo pipefail
+
+      if ! gh release view "$RELEASE_TAG" \
+        --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+        gh release create "$RELEASE_TAG" \
+          --repo "$GITHUB_REPOSITORY" \
+          --verify-tag \
+          --generate-notes \
+          --title "$RELEASE_TAG"
+      fi
+
+  - name: Upload Debian package
+    env:
+      GH_TOKEN: ${{ github.token }}
+    run: |
+      set -Eeuo pipefail
+
+      gh release upload "$RELEASE_TAG" "$DEB_PACKAGE" \
+        --repo "$GITHUB_REPOSITORY" \
+        --clobber
