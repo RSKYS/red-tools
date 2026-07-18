@@ -30,7 +30,6 @@ export DEBIAN_FRONTEND=noninteractive
 
 MARIADB_RELEASE='11.8.8'
 PHPMYADMIN_ADDRESS='127.0.0.1'
-PHPMYADMIN_PORT='3001'
 PHPMYADMIN_SERVICE='phpmyadmin-local'
 PHPMYADMIN_RUNTIME='/run/phpmyadmin-local'
 
@@ -386,33 +385,48 @@ restore_phpmyadmin_debconf() {
 	fi
 }
 
-verify_mariadb_listener() {
-	effective_port=$(mariadb --protocol=socket --batch --skip-column-names \
-		-e 'SELECT @@GLOBAL.port;' 2> /dev/null || true)
+port_is_in_use() {
+	port=$1
+	port_hex=$(awk -v port="$port" 'BEGIN { printf "%04X", port }')
 
-	[ "$effective_port" = '3306' ] \
-		|| fail "MariaDB effective port is ${effective_port:-unknown}, expected 3306."
+	awk -v local_port=":$port_hex" '
+		$2 ~ local_port "$" && $4 == "0A" { found = 1; exit }
+		END { exit found ? 0 : 1 }
+	' /proc/net/tcp /proc/net/tcp6 2> /dev/null
+}
 
-	listener_output=$(ss -H -ltn 'sport = :3306' 2> /dev/null || true)
-	[ -n "$listener_output" ] \
-		|| fail 'No TCP listener was found for MariaDB on port 3306.'
+prompt_installation_ports() {
+	printf '%s' 'phpMyAdmin Port: ' >&2
+	IFS= read -r PHPMYADMIN_PORT || fail 'Input ended unexpectedly.'
 
-	if ! printf '%s\n' "$listener_output" | awk '
-		{
-			local_address = $4
-			if (local_address == "127.0.0.1:3306") {
-				expected = 1
-			} else {
-				unexpected = 1
-			}
-		}
-		END {
-			exit (expected == 1 && unexpected != 1) ? 0 : 1
-		}
-	'; then
-		warn 'Detected TCP listeners on port 3306:'
-		printf '%s\n' "$listener_output" >&2
-		fail 'MariaDB must listen only on 127.0.0.1:3306.'
+	printf '%s' 'MariaDB Port [3306]: ' >&2
+	IFS= read -r MARIADB_PORT || fail 'Input ended unexpectedly.'
+	MARIADB_PORT=${MARIADB_PORT:-3306}
+
+	case $PHPMYADMIN_PORT in
+		'' | *[!0-9]*) fail 'PHPMYADMIN_PORT must be an integer from 1 to 65535.' ;;
+	esac
+	[ "$PHPMYADMIN_PORT" -ge 1 ] 2> /dev/null \
+		&& [ "$PHPMYADMIN_PORT" -le 65535 ] 2> /dev/null \
+		|| fail 'PHPMYADMIN_PORT must be an integer from 1 to 65535.'
+
+	case $MARIADB_PORT in
+		'' | *[!0-9]*) fail 'MARIADB_PORT must be an integer from 1 to 65535.' ;;
+	esac
+	[ "$MARIADB_PORT" -ge 1 ] 2> /dev/null \
+		&& [ "$MARIADB_PORT" -le 65535 ] 2> /dev/null \
+		|| fail 'MARIADB_PORT must be an integer from 1 to 65535.'
+
+	if port_is_in_use "$PHPMYADMIN_PORT"; then
+		warn "PHPMYADMIN_PORT $PHPMYADMIN_PORT is currently in use."
+	else
+		info "PHPMYADMIN_PORT $PHPMYADMIN_PORT is currently available."
+	fi
+
+	if port_is_in_use "$MARIADB_PORT"; then
+		warn "MARIADB_PORT $MARIADB_PORT is currently in use."
+	else
+		info "MARIADB_PORT $MARIADB_PORT is currently available."
 	fi
 }
 
@@ -595,12 +609,12 @@ deploy() {
 		*) fail "Installed server is not MariaDB $MARIADB_RELEASE: ${MARIADB_VERSION:-unknown}" ;;
 	esac
 
-	info 'Binding MariaDB to 127.0.0.1:3306'
+	info 'Binding MariaDB to 127.0.0.1:$MARIADB_PORT'
 	mkdir -p /etc/mysql/mariadb.conf.d
 	cat > "$MARIADB_BIND_CONFIG" <<- MARIADB
 		[mariadbd]
 		bind-address = 127.0.0.1
-		port = 3306
+		port = $MARIADB_PORT
 		skip-name-resolve
 	MARIADB
 	chmod 0644 "$MARIADB_BIND_CONFIG"
@@ -609,8 +623,6 @@ deploy() {
 	systemctl restart mariadb
 	mariadb-admin --protocol=socket ping > /dev/null 2>&1 \
 		|| fail 'MariaDB did not become ready.'
-
-	verify_mariadb_listener
 
 	[ -d /usr/share/phpmyadmin ] \
 		|| fail 'The phpMyAdmin document root was not installed.'
@@ -632,7 +644,7 @@ deploy() {
 		++\$i;
 		\$cfg['Servers'][\$i]['verbose'] = 'Local MariaDB';
 		\$cfg['Servers'][\$i]['host'] = '127.0.0.1';
-		\$cfg['Servers'][\$i]['port'] = '3306';
+		\$cfg['Servers'][\$i]['port'] = '$MARIADB_PORT';
 		\$cfg['Servers'][\$i]['connect_type'] = 'tcp';
 		\$cfg['Servers'][\$i]['auth_type'] = 'cookie';
 		\$cfg['Servers'][\$i]['compress'] = false;
@@ -704,7 +716,7 @@ deploy() {
 
 	MYSQL_PWD=$DB_PASSWORD mariadb --protocol=TCP \
 		--host=127.0.0.1 \
-		--port=3306 \
+		--port=$MARIADB_PORT \
 		--user="$user" \
 		--database="$app" \
 		--execute='SELECT 1;' > /dev/null 2>&1 \
@@ -715,7 +727,7 @@ deploy() {
 
 	info 'Installation completed successfully.'
 	info "phpMyAdmin is listening only at http://$PHPMYADMIN_ADDRESS:$PHPMYADMIN_PORT/"
-	printf 'mysql://%s:%s@127.0.0.1:3306/%s\n' "$user" "$ENCODED_PASSWORD" "$app"
+	printf 'mysql://%s:%s@127.0.0.1:$MARIADB_PORT/%s\n' "$user" "$ENCODED_PASSWORD" "$app"
 }
 
 read_managed_name() {
@@ -880,6 +892,7 @@ fi
 
 case $ACTION in
 	deploy | install | --deploy | --install)
+		prompt_installation_ports
 		deploy
 		;;
 	uninstall | remove | --uninstall | --remove)
