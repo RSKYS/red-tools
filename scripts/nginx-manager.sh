@@ -1673,9 +1673,8 @@ stream_upstream_name() {
 	sun_public_port=$2
 	sun_safe=$(printf '%s' "$sun_domain" | sed 's/[.-]/_/g')
 	sun_prefix=$(printf '%s' "$sun_safe" | cut -c '1-36')
-	sun_checksum=$(domain_checksum "$sun_domain")
-	printf 'sni_%s_%s_%s\n' "$sun_public_port" "$sun_prefix" "$sun_checksum"
-	unset sun_domain sun_public_port sun_safe sun_prefix sun_checksum
+	printf 'sni_%s_%s\n' "$sun_public_port" "$sun_prefix"
+	unset sun_domain sun_public_port sun_safe sun_prefix
 }
 
 ensure_stream_include() {
