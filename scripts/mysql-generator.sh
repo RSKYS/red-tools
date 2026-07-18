@@ -87,9 +87,9 @@ random_hex() {
 generate_password() {
 	while :; do
 		password=$(tr -dc 'A-Za-z0-9!@#%&_=+^-' < /dev/urandom \
-			| dd bs=1 count=17 2> /dev/null)
+			| dd bs=1 count=20 2> /dev/null)
 
-		[ "${#password}" -eq 17 ] || continue
+		[ "${#password}" -eq 20 ] || continue
 
 		case $password in *[A-Z]*) ;; *) continue ;; esac
 		case $password in *[a-z]*) ;; *) continue ;; esac
@@ -730,7 +730,7 @@ deploy() {
 	app=$(select_new_database_name)
 	user=$(select_new_database_user)
 	DB_PASSWORD=$(generate_password)
-	[ "${#DB_PASSWORD}" -eq 17 ] || fail 'Unable to generate a strong database password.'
+	[ "${#DB_PASSWORD}" -eq 20 ] || fail 'Unable to generate a strong database password.'
 
 	# Record ownership before SQL execution so a partial deployment remains removable.
 	printf '%s\n' "$app" > "$DATABASE_FILE"
@@ -762,8 +762,8 @@ deploy() {
 	info 'Installation completed successfully.'
 	info "phpMyAdmin is listening only at http://$PHPMYADMIN_ADDRESS:$PHPMYADMIN_PORT/"
 	printf 'phpMyAdmin username: %s\n' "$user"
-	printf 'phpMyAdmin password: %s\n' "$DB_PASSWORD"
-	printf 'mysql://%s:%s@127.0.0.1:%s/%s\n' "$user" "$ENCODED_PASSWORD" "$MARIADB_PORT" "$app"
+	printf '\nDatabase URL: mysql://%s:%s@127.0.0.1:%s/%s\n' "$user" "$DB_PASSWORD" "$MARIADB_PORT" "$app"
+	printf 'Raw password: %s\n' "$ENCODED_PASSWORD"
 }
 
 read_managed_name() {
