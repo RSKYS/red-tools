@@ -16,8 +16,15 @@ install: build
 	for script in $(SCRIPT_DIR)/*; do
 		[ -f "$$script" ] || continue
 		name=$${script##*/}
-		name=$${name%.*}
-		install -m 755 "$$script" "$(DESTDIR)$(BIN_PATH)/$$name"
+		basename=$${name%.*}
+		case "$$name" in
+			*.c)
+				gcc "$$script" -o "$(DESTDIR)$(BIN_PATH)/$$basename"
+				;;
+			*.sh)
+				install -m 755 "$$script" "$(DESTDIR)$(BIN_PATH)/$$basename"
+				;;
+		esac
 	done
 
 uninstall:
