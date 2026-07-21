@@ -969,9 +969,92 @@ remove_default_site() {
 	unset rds_default rds_backup
 }
 
+bootstrap_certificates() {
+	ebc_directory="$NGINX_CONF_DIR/certs"
+	ebc_certificate="$ebc_directory/cert.pem"
+	ebc_private_key="$ebc_directory/cert.key"
+
+	if [ -f "$ebc_certificate" ] && [ -f "$ebc_private_key" ]; then
+		log_info "Preserving the existing bootstrap certificate pair in $ebc_directory."
+		unset ebc_directory ebc_certificate ebc_private_key
+		return 0
+	fi
+
+	if [ -e "$ebc_certificate" ] || [ -L "$ebc_certificate" ] \
+		|| [ -e "$ebc_private_key" ] || [ -L "$ebc_private_key" ]; then
+		fatal "The bootstrap certificate pair is incomplete; refusing to overwrite existing material in $ebc_directory."
+	fi
+
+	command_exists openssl \
+		|| fatal "OpenSSL is required to generate the bootstrap certificate pair."
+
+	ebc_workspace="$BACKUP_DIR/bootstrap-certificate"
+	ebc_config="$ebc_workspace/openssl.cnf"
+	ebc_staged_certificate="$ebc_workspace/cert.pem"
+	ebc_staged_private_key="$ebc_workspace/cert.key"
+
+	run_or_die "Creating the bootstrap-certificate workspace" mkdir -p "$ebc_workspace"
+	run_or_die "Securing the bootstrap-certificate workspace" chmod 0700 "$ebc_workspace"
+
+	cat > "$ebc_config" <<- BOOTSTRAP_CONFIG
+		[req]
+		prompt = no
+		distinguished_name = distinguished_name
+		x509_extensions = extensions
+
+		[distinguished_name]
+		CN = localhost
+
+		[extensions]
+		basicConstraints = critical,CA:FALSE
+		keyUsage = critical,digitalSignature,keyEncipherment
+		extendedKeyUsage = serverAuth
+		subjectAltName = @subject_alt_names
+
+		[subject_alt_names]
+		DNS.1 = localhost
+		IP.1 = 127.0.0.1
+		IP.2 = ::1
+	BOOTSTRAP_CONFIG
+
+	chmod 0600 "$ebc_config" \
+		|| fatal "Could not secure the bootstrap OpenSSL configuration."
+
+	log_info "Generating a 10-year local bootstrap certificate in $ebc_directory"
+	if ! (
+		umask 077
+		openssl req -x509 -nodes -days 3650 -sha256 \
+			-newkey rsa:2048 -config "$ebc_config" \
+			-keyout "$ebc_staged_private_key" \
+			-out "$ebc_staged_certificate"
+	); then
+		fatal "Could not generate the bootstrap certificate pair."
+	fi
+
+	chmod 0600 "$ebc_staged_private_key" \
+		|| fatal "Could not secure the generated bootstrap private key."
+	chmod 0644 "$ebc_staged_certificate" \
+		|| fatal "Could not set permissions on the generated bootstrap certificate."
+
+	record_change N "$ebc_private_key" ""
+	mv "$ebc_staged_private_key" "$ebc_private_key" \
+		|| fatal "Could not install the generated bootstrap private key."
+
+	record_change N "$ebc_certificate" ""
+	mv "$ebc_staged_certificate" "$ebc_certificate" \
+		|| fatal "Could not install the generated bootstrap certificate."
+
+	log_success "Bootstrap certificate installed: $ebc_certificate"
+	log_success "Bootstrap private key installed: $ebc_private_key"
+
+	unset ebc_directory ebc_certificate ebc_private_key ebc_workspace \
+		ebc_config ebc_staged_certificate ebc_staged_private_key
+}
+
 ensure_directories() {
 	for ed_directory in \
 		"$NGINX_CONF_DIR/conf.d" \
+		"$NGINX_CONF_DIR/certs" \
 		"$NGINX_CONF_DIR/snippets" \
 		"$NGINX_CONF_DIR/stream-conf.d" \
 		"$NGINX_CONF_DIR/backups"; do
@@ -988,8 +1071,8 @@ install_packages() {
 		|| fatal "The apt command was not found. This script supports Debian/Ubuntu systems."
 
 	run_or_die "Updating APT package indexes" apt update
-	run_or_die "Installing Nginx and the stream module" \
-		apt install -y nginx libnginx-mod-stream
+	run_or_die "Installing Nginx, OpenSSL, and the stream module" \
+		apt install -y nginx openssl libnginx-mod-stream
 
 	if ! command_exists ss && ! command_exists netstat; then
 		log_warn "Neither ss nor netstat is installed; installing iproute2 to provide ss."
@@ -1405,6 +1488,12 @@ select_certificate_paths() {
 
 	for scp_pair in \
 		"$NGINX_CONF_DIR/../letsencrypt/live/$DOMAIN/fullchain.pem|$NGINX_CONF_DIR/../letsencrypt/live/$DOMAIN/privkey.pem" \
+		"$NGINX_CONF_DIR/certs/$DOMAIN/fullchain.pem|$NGINX_CONF_DIR/certs/$DOMAIN/privkey.pem" \
+		"$NGINX_CONF_DIR/certs/$DOMAIN.crt|$NGINX_CONF_DIR/certs/$DOMAIN.key" \
+		"$NGINX_CONF_DIR/certs/$DOMAIN.cer|$NGINX_CONF_DIR/certs/$DOMAIN.key" \
+		"/etc/certs/$DOMAIN/fullchain.pem|/etc/certs/$DOMAIN/privkey.pem" \
+		"/etc/certs/$DOMAIN/$DOMAIN.crt|/etc/certs/$DOMAIN/$DOMAIN.key" \
+		"/etc/certs/$DOMAIN/$DOMAIN.cer|/etc/certs/$DOMAIN/$DOMAIN.key" \
 		"$NGINX_CONF_DIR/ssl/$DOMAIN.crt|$NGINX_CONF_DIR/ssl/$DOMAIN.key" \
 		"$NGINX_CONF_DIR/ssl/$DOMAIN.cer|$NGINX_CONF_DIR/ssl/$DOMAIN.key" \
 		"/etc/ssl/$DOMAIN/$DOMAIN.crt|/etc/ssl/$DOMAIN/$DOMAIN.key"; do
@@ -3893,6 +3982,7 @@ main() {
 		ensure_directories
 		init_transaction
 		remove_default_site
+		bootstrap_certificates
 		write_redirect_snippet
 	fi
 
