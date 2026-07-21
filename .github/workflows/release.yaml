@@ -11,7 +11,7 @@ permissions:
 jobs:
   release-deb:
     name: Build and upload .deb
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out release tag
