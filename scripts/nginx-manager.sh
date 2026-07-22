@@ -961,7 +961,7 @@ remove_default_site() {
 	fi
 
 	log_warn "Nginx's default enabled site exists: $rds_default"
-	if ! confirm "Disable it by moving it into the transaction backup directory?" yes; then
+	if ! confirm "Disable it by moving it into the transaction backup directory?" no; then
 		rm -f "$rds_default" 2> /dev/null || :
 		unset rds_default
 		return 0
@@ -1713,7 +1713,7 @@ client_max_body_size() {
 
 	while :; do
 		printf '\nThis will control the maximum allowed size of the client request body; important for large file uploads or JSON payloads.\n'
-		printf '%s' 'Do you want to set a custom max body size for this node? [y/N]:'
+		printf '%s' 'Do you want to set a custom max body size for this node? [y/N]: '
 
 		if ! IFS= read -r pcmbs_answer; then
 			printf '\n'
@@ -3043,9 +3043,9 @@ configure_domain_mode() {
 
 	if confirm "Use Nginx-managed certificates?" yes; then
 		TLS_PASSTHROUGH=0
-		client_max_body_size 443
 		select_certificate_paths
 		validate_certificate_pair
+		client_max_body_size 443
 	else
 		client_max_body_size 443
 
@@ -3119,9 +3119,9 @@ configure_custom_port_mode() {
 
 	if confirm "Use Nginx-managed certificates?" yes; then
 		TLS_PASSTHROUGH=0
-		client_max_body_size "$HTTPS_PORT"
 		select_certificate_paths
 		validate_certificate_pair
+		client_max_body_size "$HTTPS_PORT"
 	else
 		client_max_body_size "$HTTPS_PORT"
 
@@ -4127,7 +4127,7 @@ main() {
 		printf '\033[1mNginx Reverse-Proxy Manager\033[0m\n'
 		printf 'This installer will install packages and modify Nginx configuration files.\n\n'
 
-		if ! confirm "Proceed with package installation and transactional Nginx changes?" no; then
+		if ! confirm "Proceed with package installation and transactional Nginx changes?" yes; then
 			log_warn "No changes were made."
 			unset NGINX_CONF_DIR NGINX_MAIN_CONF NGINX_BIN STATE_FILE \
 				IPV6_ENABLED IPV6_LISTEN_PREFIX MANAGED_EXISTING
