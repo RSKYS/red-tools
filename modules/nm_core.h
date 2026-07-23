@@ -34,7 +34,8 @@ NM_BEGIN_DECLS
 
 /**
  * @brief Process-wide mutable application state.
- * @warning The current application is single-threaded; serialize access if extended.
+ * @warning The current application is single-threaded; serialize access if
+ * extended.
  */
 NM_INTERNAL App app;
 
@@ -98,9 +99,11 @@ NM_INTERNAL const char *env_default(const char *name, const char *fallback);
 NM_INTERNAL void vlog_message(FILE *out, const char *color, const char *label,
                               const char *fmt, va_list ap);
 
-/** @brief Logs an informational record. @param fmt printf-compatible format string. */
+/** @brief Logs an informational record. @param fmt printf-compatible format
+ * string. */
 NM_INTERNAL void log_info(const char *fmt, ...) NM_PRINTF(1, 2);
-/** @brief Logs a successful-operation record. @param fmt printf-compatible format string. */
+/** @brief Logs a successful-operation record. @param fmt printf-compatible
+ * format string. */
 NM_INTERNAL void log_success(const char *fmt, ...) NM_PRINTF(1, 2);
 /** @brief Logs a warning record. @param fmt printf-compatible format string. */
 NM_INTERNAL void log_warn(const char *fmt, ...) NM_PRINTF(1, 2);
@@ -115,7 +118,8 @@ NM_INTERNAL void fatalf(const char *fmt, ...) NM_PRINTF(1, 2) NM_NORETURN;
 
 /** @brief Initializes an empty buffer. @param b Buffer object to initialize. */
 NM_INTERNAL void buffer_init(Buffer *b);
-/** @brief Releases all buffer storage and resets the object. @param b Buffer object. */
+/** @brief Releases all buffer storage and resets the object. @param b Buffer
+ * object. */
 NM_INTERNAL void buffer_free(Buffer *b);
 /**
  * @brief Ensures capacity for an additional payload.
@@ -145,12 +149,12 @@ NM_INTERNAL int buffer_append(Buffer *b, const char *s);
  * @param fmt printf-compatible format string.
  * @return 0 on success; -1 on invalid arguments or overflow.
  */
-NM_INTERNAL int buffer_printf(Buffer *b, const char *fmt, ...)
-    NM_PRINTF(2, 3);
+NM_INTERNAL int buffer_printf(Buffer *b, const char *fmt, ...) NM_PRINTF(2, 3);
 
 /** @brief Initializes an empty string vector. @param v Vector to initialize. */
 NM_INTERNAL void strvec_init(StrVec *v);
-/** @brief Releases all strings and vector storage. @param v Vector to destroy. */
+/** @brief Releases all strings and vector storage. @param v Vector to destroy.
+ */
 NM_INTERNAL void strvec_free(StrVec *v);
 /**
  * @brief Appends an owned duplicate of a string.
@@ -187,13 +191,17 @@ NM_INTERNAL intS confirm(const char *prompt, intS default_yes);
  * @return Pointer to the first non-space byte, or NULL for a null input.
  */
 NM_INTERNAL char *trim_in_place(char *s);
-/** @brief Counts occurrences of a byte. @param s Source string. @param wanted Byte to count. @return Count. */
+/** @brief Counts occurrences of a byte. @param s Source string. @param wanted
+ * Byte to count. @return Count. */
 NM_INTERNAL int count_char(const char *s, char wanted);
-/** @brief Tests a string prefix. @param s Source string. @param prefix Prefix. @return Nonzero on match. */
+/** @brief Tests a string prefix. @param s Source string. @param prefix Prefix.
+ * @return Nonzero on match. */
 NM_INTERNAL intS starts_with(const char *s, const char *prefix);
-/** @brief Tests a string suffix. @param s Source string. @param suffix Suffix. @return Nonzero on match. */
+/** @brief Tests a string suffix. @param s Source string. @param suffix Suffix.
+ * @return Nonzero on match. */
 NM_INTERNAL intS ends_with(const char *s, const char *suffix);
-/** @brief Converts ASCII letters to lowercase in place. @param s Mutable string. */
+/** @brief Converts ASCII letters to lowercase in place. @param s Mutable
+ * string. */
 NM_INTERNAL void lower_ascii(char *s);
 
 /**

@@ -1,6 +1,7 @@
 /**
  * @file nm_validators.h
- * @brief Input validation, interactive prompts, ports, addresses, URLs, and identifiers.
+ * @brief Input validation, interactive prompts, ports, addresses, URLs, and
+ * identifiers.
  *
  * @internal These declarations match the project's single-translation-unit
  * implementation and are not a stable external ABI.
@@ -13,13 +14,16 @@
 NM_BEGIN_DECLS
 
 /**
- * @brief Implements shared hostname validation with configurable dot and underscore rules.
+ * @brief Implements shared hostname validation with configurable dot and
+ * underscore rules.
  * @param s Input string.
  * @param require_dot Nonzero to require a multi-label hostname.
  * @param allow_underscore Nonzero to permit underscore characters in labels.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
-NM_INTERNAL intS valid_hostname_common(const char *s, intS require_dot, intS allow_underscore);
+NM_INTERNAL intS valid_hostname_common(const char *s, intS require_dot,
+                                       intS allow_underscore);
 
 /**
  * @brief Validates a public DNS domain name.
@@ -86,12 +90,14 @@ NM_INTERNAL void prompt_domain(const char *prompt);
 NM_INTERNAL void prompt_existing_file(const char *label, char *out, size_t cap);
 
 /**
- * @brief Prompts for a TCP port, applies a default, and checks active listeners.
+ * @brief Prompts for a TCP port, applies a default, and checks active
+ * listeners.
  * @param label Human-readable input label.
  * @param default_port Port selected when the user submits an empty answer.
  * @param out Caller-provided output object or buffer.
  */
-NM_INTERNAL void prompt_port(const char *label, unsigned default_port, unsigned *out);
+NM_INTERNAL void prompt_port(const char *label, unsigned default_port,
+                             unsigned *out);
 
 /**
  * @brief Validates an Nginx location expression.
@@ -114,20 +120,25 @@ NM_INTERNAL intS validate_proxy_url(const char *url);
 NM_INTERNAL void client_max_body_size(unsigned https_port);
 
 /**
- * @brief Finds an unused TCP port in an inclusive range and stores it in application state.
+ * @brief Finds an unused TCP port in an inclusive range and stores it in
+ * application state.
  * @param minimum Inclusive lower bound for random port selection.
- * @param maximum Inclusive upper bound or maximum token length, depending on function.
+ * @param maximum Inclusive upper bound or maximum token length, depending on
+ * function.
  */
 NM_INTERNAL void find_random_port(unsigned minimum, unsigned maximum);
 
 /**
- * @brief Converts a domain into a bounded identifier with a checksum suffix when necessary.
+ * @brief Converts a domain into a bounded identifier with a checksum suffix
+ * when necessary.
  * @param domain Validated public domain.
- * @param maximum Inclusive upper bound or maximum token length, depending on function.
+ * @param maximum Inclusive upper bound or maximum token length, depending on
+ * function.
  * @param out Caller-provided output object or buffer.
  * @param cap Total capacity of the output buffer in bytes.
  */
-NM_INTERNAL void bounded_domain_token(const char *domain, size_t maximum, char *out, size_t cap);
+NM_INTERNAL void bounded_domain_token(const char *domain, size_t maximum,
+                                      char *out, size_t cap);
 
 /**
  * @brief Builds a bounded Nginx stream upstream identifier.
@@ -137,7 +148,9 @@ NM_INTERNAL void bounded_domain_token(const char *domain, size_t maximum, char *
  * @param out Caller-provided output object or buffer.
  * @param cap Total capacity of the output buffer in bytes.
  */
-NM_INTERNAL void stream_upstream_name(const char *domain, unsigned public_port, unsigned backend_port, char *out, size_t cap);
+NM_INTERNAL void stream_upstream_name(const char *domain, unsigned public_port,
+                                      unsigned backend_port, char *out,
+                                      size_t cap);
 
 NM_END_DECLS
 

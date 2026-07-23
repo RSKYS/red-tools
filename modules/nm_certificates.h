@@ -1,6 +1,7 @@
 /**
  * @file nm_certificates.h
- * @brief Certificate discovery, bootstrap generation, chain handling, and validation.
+ * @brief Certificate discovery, bootstrap generation, chain handling, and
+ * validation.
  *
  * @internal These declarations match the project's single-translation-unit
  * implementation and are not a stable external ABI.
@@ -23,12 +24,14 @@ NM_INTERNAL void bootstrap_certificates(void);
 NM_INTERNAL void bootstrap_certificate_pair(void);
 
 /**
- * @brief Discovers common certificate locations and prompts for the selected pair.
+ * @brief Discovers common certificate locations and prompts for the selected
+ * pair.
  */
 NM_INTERNAL void select_certificate_paths(void);
 
 /**
- * @brief Uses OpenSSL to verify certificate/key consistency and certificate validity.
+ * @brief Uses OpenSSL to verify certificate/key consistency and certificate
+ * validity.
  */
 NM_INTERNAL void validate_certificate_pair(void);
 

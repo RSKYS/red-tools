@@ -1,6 +1,7 @@
 /**
  * @file nm_nginx_parser.h
- * @brief Managed Nginx parsing, inventories, isolated validation, and candidate commits.
+ * @brief Managed Nginx parsing, inventories, isolated validation, and candidate
+ * commits.
  *
  * @internal These declarations match the project's single-translation-unit
  * implementation and are not a stable external ABI.
@@ -24,7 +25,8 @@ NM_INTERNAL void load_lines(const char *path, StrVec *lines);
  * @param path Filesystem or procfs path.
  * @param lines String vector receiving or supplying text lines.
  * @param mode POSIX permission mode.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
 NM_INTERNAL int write_lines(const char *path, const StrVec *lines, mode_t mode);
 
@@ -35,7 +37,8 @@ NM_INTERNAL int write_lines(const char *path, const StrVec *lines, mode_t mode);
  * @param listen Nginx listen directive value.
  * @param server Server name or endpoint text.
  */
-NM_INTERNAL void listener_vec_push(ListenerVec *v, const char *file, const char *listen, const char *server);
+NM_INTERNAL void listener_vec_push(ListenerVec *v, const char *file,
+                                   const char *listen, const char *server);
 
 /**
  * @brief Appends an upstream inventory record using bounded copies.
@@ -44,7 +47,8 @@ NM_INTERNAL void listener_vec_push(ListenerVec *v, const char *file, const char 
  * @param name Executable, upstream, environment, or block name.
  * @param target Live target path or generated target identifier.
  */
-NM_INTERNAL void upstream_vec_push(UpstreamVec *v, const char *file, const char *name, const char *target);
+NM_INTERNAL void upstream_vec_push(UpstreamVec *v, const char *file,
+                                   const char *name, const char *target);
 
 /**
  * @brief Extracts and normalizes the value of a named Nginx directive.
@@ -54,7 +58,8 @@ NM_INTERNAL void upstream_vec_push(UpstreamVec *v, const char *file, const char 
  * @param cap Total capacity of the output buffer in bytes.
  * @return Nonzero on success; otherwise zero.
  */
-NM_INTERNAL intS directive_value(const char *line, const char *directive, char *out, size_t cap);
+NM_INTERNAL intS directive_value(const char *line, const char *directive,
+                                 char *out, size_t cap);
 
 /**
  * @brief Tests whether a line opens a named Nginx block.
@@ -86,9 +91,10 @@ NM_INTERNAL unsigned endpoint_port(const char *spec);
 /**
  * @brief Reports whether a managed listener endpoint is active and Nginx-owned.
  * @param spec Nginx endpoint specification.
- * @return A borrowed pointer that remains valid for the lifetime described by the implementation.
+ * @return A borrowed pointer that remains valid for the lifetime described by
+ * the implementation.
  */
-NM_INTERNAL const char * managed_listener_status(const char *spec);
+NM_INTERNAL const char *managed_listener_status(const char *spec);
 
 /**
  * @brief Prints current managed listener and upstream inventories.
@@ -110,13 +116,15 @@ NM_INTERNAL void print_captured(const Buffer *b, FILE *out);
 
 /**
  * @brief Creates a unique isolated directory for candidate validation.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
 NM_INTERNAL intS make_validation_dir(void);
 
 /**
  * @brief Copies the current Nginx configuration into the validation directory.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
 NM_INTERNAL intS copy_validation_tree(void);
 
@@ -126,9 +134,11 @@ NM_INTERNAL intS copy_validation_tree(void);
  * @param from Literal token to replace.
  * @param to Replacement text.
  * @param out Caller-provided output object or buffer.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
-NM_INTERNAL int replace_all(const char *input, const char *from, const char *to, Buffer *out);
+NM_INTERNAL int replace_all(const char *input, const char *from, const char *to,
+                            Buffer *out);
 
 /**
  * @brief Tests a generated candidate in an isolated Nginx configuration tree.
@@ -136,13 +146,15 @@ NM_INTERNAL int replace_all(const char *input, const char *from, const char *to,
  * @param candidate Generated candidate file path.
  * @return Nonzero when the predicate is true; otherwise zero.
  */
-NM_INTERNAL intS validate_nginx_candidate(const char *target, const char *candidate);
+NM_INTERNAL intS validate_nginx_candidate(const char *target,
+                                          const char *candidate);
 
 /**
  * @brief Validates and installs the active generated Nginx candidate.
  * @param target Live target path or generated target identifier.
  * @param mode POSIX permission mode.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
 NM_INTERNAL intS commit_nginx_file(const char *target, mode_t mode);
 
@@ -150,7 +162,8 @@ NM_INTERNAL intS commit_nginx_file(const char *target, mode_t mode);
  * @brief Validates and installs an explicitly selected managed-file candidate.
  * @param target Live target path or generated target identifier.
  * @param mode POSIX permission mode.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
 NM_INTERNAL intS finalize_selected_file(const char *target, mode_t mode);
 

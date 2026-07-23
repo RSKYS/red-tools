@@ -1,6 +1,7 @@
 /**
  * @file nm_runtime.h
- * @brief Runtime path initialization, privilege checks, state persistence, and package setup.
+ * @brief Runtime path initialization, privilege checks, state persistence, and
+ * package setup.
  *
  * @internal These declarations match the project's single-translation-unit
  * implementation and are not a stable external ABI.
@@ -13,7 +14,8 @@
 NM_BEGIN_DECLS
 
 /**
- * @brief Validates a safe absolute filesystem path accepted by runtime configuration.
+ * @brief Validates a safe absolute filesystem path accepted by runtime
+ * configuration.
  * @param s Input string.
  * @return Nonzero when the predicate is true; otherwise zero.
  */
@@ -26,7 +28,8 @@ NM_INTERNAL void initialize_runtime_paths(void);
 
 /**
  * @brief Loads and validates persistent manager state from disk.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
 NM_INTERNAL intS load_management_state(void);
 
@@ -46,7 +49,8 @@ NM_INTERNAL void require_root(void);
 NM_INTERNAL void prompt_ipv6_support(void);
 
 /**
- * @brief Creates required Nginx and manager directories with controlled permissions.
+ * @brief Creates required Nginx and manager directories with controlled
+ * permissions.
  */
 NM_INTERNAL void ensure_directories(void);
 
@@ -56,7 +60,8 @@ NM_INTERNAL void ensure_directories(void);
 NM_INTERNAL void validate_existing_managed_runtime(void);
 
 /**
- * @brief Installs required Nginx and certificate packages through the available package manager.
+ * @brief Installs required Nginx and certificate packages through the available
+ * package manager.
  */
 NM_INTERNAL void install_packages(void);
 

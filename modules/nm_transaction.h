@@ -29,12 +29,14 @@ NM_INTERNAL volatile sig_atomic_t nm_pending_signal;
 NM_INTERNAL void check_interrupted(void);
 
 /**
- * @brief Restores or removes transaction-managed paths according to the manifest.
+ * @brief Restores or removes transaction-managed paths according to the
+ * manifest.
  */
 NM_INTERNAL void rollback_transaction(void);
 
 /**
- * @brief Handles termination signals by cleaning temporary resources and attempting rollback.
+ * @brief Handles termination signals by cleaning temporary resources and
+ * attempting rollback.
  * @param signo Signal number delivered by the operating system.
  */
 NM_INTERNAL void signal_handler(int signo);

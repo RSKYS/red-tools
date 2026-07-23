@@ -19,7 +19,15 @@ install: build
 		basename=$${name%.*}
 		case "$$name" in
 			*.c)
-				gcc "$$script" -o "$(DESTDIR)$(BIN_PATH)/$$basename"
+				gcc \
+					-fhardened -O2 \
+					-Wall -Wextra \
+					-Wformat=2 \
+					-Wformat-security \
+					-Wmissing-prototypes \
+					-Wshadow \
+					-Wstrict-prototypes \
+				"$$script" -o "$(DESTDIR)$(BIN_PATH)/$$basename"
 				;;
 			*.sh)
 				install -m 755 "$$script" "$(DESTDIR)$(BIN_PATH)/$$basename"

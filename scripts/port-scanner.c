@@ -43,7 +43,6 @@
 #define MAX_QUEUE_CAPACITY 4224
 #define MAX_WORKERS 384
 #define MIN_QUEUE_CAPACITY 128
-
 #define DEFAULT_PARALLEL 5120
 #define FIRST_PORT 80
 #define SECND_PORT 443
@@ -93,14 +92,6 @@ static void *xmalloc(size_t size)
 	if (!p)
 		die_perror("error: malloc failure");
 	return p;
-}
-
-static char *xstrdup(const char *s)
-{
-	size_t len = strlen(s) + 1;
-	char *copy = xmalloc(len);
-	memcpy(copy, s, len);
-	return copy;
 }
 
 static bool valid_ipv4(const char *ip)

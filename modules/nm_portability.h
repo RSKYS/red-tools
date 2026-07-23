@@ -31,15 +31,16 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 /** @brief Marks a printf-compatible function and enables format checking. */
-#define NM_PRINTF(format_index, first_arg) \
-    __attribute__((format(printf, format_index, first_arg)))
+#define NM_PRINTF(format_index, first_arg)                                     \
+  __attribute__((format(printf, format_index, first_arg)))
 /** @brief Marks a function that never returns to its caller. */
 #define NM_NORETURN __attribute__((noreturn))
 /** @brief Marks a function whose return value should not be discarded. */
 #define NM_NODISCARD __attribute__((warn_unused_result))
 /** @brief Marks an intentionally unused declaration or object. */
 #define NM_UNUSED __attribute__((unused))
-/** @brief Marks an allocator-like function whose result does not alias live objects. */
+/** @brief Marks an allocator-like function whose result does not alias live
+ * objects. */
 #define NM_MALLOC __attribute__((malloc))
 /** @brief Associates an allocation result size with a size parameter. */
 #define NM_ALLOC_SIZE(index) __attribute__((alloc_size(index)))
@@ -55,7 +56,7 @@
 #define NM_DIAGNOSTIC_POP _Pragma("GCC diagnostic pop")
 /** @brief Disables a GCC/Clang diagnostic named by a string literal. */
 #define NM_DIAGNOSTIC_IGNORE(option) \
-    _Pragma(NM_STRINGIFY(GCC diagnostic ignored option))
+  _Pragma(NM_STRINGIFY(GCC diagnostic ignored option))
 #else
 #define NM_PRINTF(format_index, first_arg)
 #define NM_NORETURN
@@ -94,7 +95,8 @@
 #endif
 
 /** @brief Compile-time assertion with a descriptive diagnostic message. */
-#define NM_STATIC_ASSERT(condition, message) _Static_assert((condition), message)
+#define NM_STATIC_ASSERT(condition, message)                                   \
+  _Static_assert((condition), message)
 
 /** @brief Returns the number of elements in a true C array. */
 #define NM_ARRAY_LEN(array) (sizeof(array) / sizeof((array)[0]))
@@ -111,11 +113,11 @@
  * Clearing the pointer prevents accidental reuse and makes repeated cleanup
  * paths idempotent.
  */
-#define NM_FREE_AND_NULL(pointer) \
-    do { \
-        free(pointer); \
-        (pointer) = NULL; \
-    } while (0)
+#define NM_FREE_AND_NULL(pointer)    \
+  do {                               \
+    free(pointer);                   \
+    (pointer) = NULL;                \
+  } while (0)
 
 /**
  * @brief Closes a valid file descriptor and resets it to -1.
@@ -123,48 +125,49 @@
  * Close failures are intentionally ignored in cleanup-only paths.  Operations
  * that need to report close errors must call close() explicitly.
  */
-#define NM_CLOSE_FD(descriptor) \
-    do { \
-        if ((descriptor) >= 0) { \
-            (void)close(descriptor); \
-            (descriptor) = -1; \
-        } \
-    } while (0)
+#define NM_CLOSE_FD(descriptor)      \
+  do {                               \
+    if ((descriptor) >= 0) {         \
+      (void)close(descriptor);       \
+      (descriptor) = -1;             \
+    }                                \
+  } while (0)
 
 /** @brief Returns from a void function when a required pointer is null. */
-#define NM_RETURN_IF_NULL(pointer) \
-    do { \
-        if (NM_UNLIKELY((pointer) == NULL)) { \
-            errno = EINVAL; \
-            return; \
-        } \
-    } while (0)
+#define NM_RETURN_IF_NULL(pointer)   \
+  do {                               \
+    if (NM_UNLIKELY((pointer) == NULL)) {                                      \
+      errno = EINVAL;                \
+      return;                        \
+    }                                \
+  } while (0)
 
 /** @brief Returns a caller-supplied value when a required pointer is null. */
-#define NM_RETURN_VALUE_IF_NULL(pointer, value) \
-    do { \
-        if (NM_UNLIKELY((pointer) == NULL)) { \
-            errno = EINVAL; \
-            return (value); \
-        } \
-    } while (0)
+#define NM_RETURN_VALUE_IF_NULL(pointer, value)                                \
+  do {                               \
+    if (NM_UNLIKELY((pointer) == NULL)) {                                      \
+      errno = EINVAL;                \
+      return (value);                \
+    }                                \
+  } while (0)
 
-/** @brief Sets errno and returns a caller-supplied value when a condition holds. */
-#define NM_RETURN_ERROR_IF(condition, error_number, value) \
-    do { \
-        if (NM_UNLIKELY(condition)) { \
-            errno = (error_number); \
-            return (value); \
-        } \
-    } while (0)
+/** @brief Sets errno and returns a caller-supplied value when a condition
+ * holds. */
+#define NM_RETURN_ERROR_IF(condition, error_number, value)                     \
+  do {                               \
+    if (NM_UNLIKELY(condition)) {    \
+      errno = (error_number);        \
+      return (value);                \
+    }                                \
+  } while (0)
 
 /** @brief Jumps to a cleanup label when a condition holds. */
 #define NM_GOTO_IF(condition, label) \
-    do { \
-        if (NM_UNLIKELY(condition)) { \
-            goto label; \
-        } \
-    } while (0)
+  do {                               \
+    if (NM_UNLIKELY(condition)) {    \
+      goto label;                    \
+    }                                \
+  } while (0)
 
 /**
  * @brief Optional compile-time logging integration hook.
@@ -173,12 +176,12 @@
  * project headers.  The default implementation has no side effects.
  */
 #ifndef NM_LOG_HOOK
-#define NM_LOG_HOOK(level, label, message) \
-    do { \
-        (void)(level); \
-        (void)(label); \
-        (void)(message); \
-    } while (0)
+#define NM_LOG_HOOK(level, label, message)                                     \
+  do {                               \
+    (void)(level);                   \
+    (void)(label);                   \
+    (void)(message);                 \
+  } while (0)
 #endif
 
 #endif

@@ -13,20 +13,26 @@
 NM_BEGIN_DECLS
 
 /**
- * @brief Returns the comment prefix used to enable or disable generated IPv6 listeners.
- * @return A borrowed pointer that remains valid for the lifetime described by the implementation.
+ * @brief Returns the comment prefix used to enable or disable generated IPv6
+ * listeners.
+ * @return A borrowed pointer that remains valid for the lifetime described by
+ * the implementation.
  */
-NM_INTERNAL const char * ipv6_prefix(void);
+NM_INTERNAL const char *ipv6_prefix(void);
 
 /**
- * @brief Writes a generated buffer to a temporary candidate and installs it with optional Nginx validation.
+ * @brief Writes a generated buffer to a temporary candidate and installs it
+ * with optional Nginx validation.
  * @param target Live target path or generated target identifier.
  * @param b Buffer object.
  * @param mode POSIX permission mode.
- * @param validate Nonzero to run isolated nginx -t validation before installation.
+ * @param validate Nonzero to run isolated nginx -t validation before
+ * installation.
  * @param failure Fatal error text used if installation cannot complete.
  */
-NM_INTERNAL void install_buffer_target(const char *target, Buffer *b, mode_t mode, intS validate, const char *failure);
+NM_INTERNAL void install_buffer_target(const char *target, Buffer *b,
+                                       mode_t mode, intS validate,
+                                       const char *failure);
 
 /**
  * @brief Generates the forced-SSL redirect snippet for a selected HTTPS port.
@@ -56,7 +62,8 @@ NM_INTERNAL void ensure_stream_include(void);
 
 /**
  * @brief Tests whether a server_name directive contains an exact domain token.
- * @param value Directive value or server endpoint being inspected or normalized.
+ * @param value Directive value or server endpoint being inspected or
+ * normalized.
  * @param domain Validated public domain.
  * @return Nonzero when the predicate is true; otherwise zero.
  */
@@ -90,7 +97,8 @@ NM_INTERNAL intS map_header_matches(const char *line, const char *variable);
 NM_INTERNAL intS upstream_header_name(const char *line, char *out, size_t cap);
 
 /**
- * @brief Finds the upstream currently selected for a domain in a stream route file.
+ * @brief Finds the upstream currently selected for a domain in a stream route
+ * file.
  * @param path Filesystem or procfs path.
  * @param domain Validated public domain.
  * @param map_variable Nginx stream map variable name.
@@ -98,7 +106,10 @@ NM_INTERNAL intS upstream_header_name(const char *line, char *out, size_t cap);
  * @param cap Total capacity of the output buffer in bytes.
  * @return Nonzero on success; otherwise zero.
  */
-NM_INTERNAL intS find_stream_route_upstream(const char *path, const char *domain, const char *map_variable, char *out, size_t cap);
+NM_INTERNAL intS find_stream_route_upstream(const char *path,
+                                            const char *domain,
+                                            const char *map_variable, char *out,
+                                            size_t cap);
 
 /**
  * @brief Tests whether a stream map route line belongs to a domain.
@@ -109,7 +120,8 @@ NM_INTERNAL intS find_stream_route_upstream(const char *path, const char *domain
 NM_INTERNAL intS route_line_for_domain(const char *line, const char *domain);
 
 /**
- * @brief Merges one domain route and upstream into an existing stream configuration.
+ * @brief Merges one domain route and upstream into an existing stream
+ * configuration.
  * @param source Source configuration file path or source text.
  * @param domain Validated public domain.
  * @param upstream Generated upstream name.
@@ -118,9 +130,14 @@ NM_INTERNAL intS route_line_for_domain(const char *line, const char *domain);
  * @param reject_upstream Fallback upstream used for unmatched SNI.
  * @param existing_upstream Previously routed upstream, when one exists.
  * @param output Generated candidate output path.
- * @return Zero or a positive success value as documented by the implementation; a negative/zero failure value otherwise.
+ * @return Zero or a positive success value as documented by the implementation;
+ * a negative/zero failure value otherwise.
  */
-NM_INTERNAL intS merge_stream_sni_candidate(const char *source, const char *domain, const char *upstream, unsigned backend_port, const char *map_variable, const char *reject_upstream, const char *existing_upstream, const char *output);
+NM_INTERNAL intS merge_stream_sni_candidate(
+    const char *source, const char *domain, const char *upstream,
+    unsigned backend_port, const char *map_variable,
+    const char *reject_upstream, const char *existing_upstream,
+    const char *output);
 
 /**
  * @brief Generates or updates SNI stream routing for the selected public port.
