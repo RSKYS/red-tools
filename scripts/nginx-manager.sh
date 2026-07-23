@@ -148,7 +148,7 @@ reset_internal_state() {
 		PORT_CHECKER MODE DOMAIN CERT_FILE KEY_FILE HTTP_PORT HTTPS_PORT \
 		TLS_INTERNAL_PORT BACKEND_PORT TLS_PASSTHROUGH SITE_CONFIG STREAM_CONFIG \
 		HTTP_REDIRECT_CONFIG REDIRECT_SNIPPET LOCATION_FRAGMENT UPSTREAM_FRAGMENT \
-		WS_MAP_VAR PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
+		PROMPTED_FILE PROMPTED_PORT SELECTED_FREE_PORT IPV6_ENABLED \
 		IPV6_LISTEN_PREFIX STATE_FILE MANAGED_EXISTING MANAGED_INSTALLED_AT \
 		MANAGED_LAST_CONFIGURED_AT MANAGED_NODE_ACTION MANAGED_NODE_DESCRIPTION \
 		MANAGED_NEW_PORT BODY_SIZE_MB CA_FILE SSL_CERTIFICATE_FILE \
@@ -1930,13 +1930,6 @@ bounded_domain_token() {
 		bdt_prefix_length bdt_prefix
 }
 
-websocket_map_variable() {
-	wmv_domain=$1
-	wmv_checksum=$(domain_checksum "$wmv_domain")
-	printf 'map_%s\n' "$wmv_checksum"
-	unset wmv_domain wmv_checksum
-}
-
 stream_upstream_name() {
 	sun_domain=$1
 	sun_public_port=$2
@@ -2025,18 +2018,110 @@ write_domain_redirect_80() {
 	wdr_target="$NGINX_CONF_DIR/conf.d/redirect_80.conf"
 	make_temp_for "$wdr_target"
 
-	cat > "$CURRENT_TMP" <<- DOMAIN_REDIRECT_80
-		# nginx-manager: Public HTTP catch-all.
-		# Unknown Host headers are closed without returning content.
-		server {
-		    listen 80 default_server;
-		    ${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
-		    server_name _;
+	if [ -f "$wdr_target" ] \
+		&& is_script_managed_file "$wdr_target" \
+		&& grep '^[[:space:]]*listen[[:space:]]\+80[[:space:]].*default_server' \
+			"$wdr_target" > /dev/null 2>&1; then
+		# Preserve all existing managed domain redirects, but replace any
+		# existing block for the domain currently being configured. This keeps
+		# public HTTP redirects synchronized for certificate-terminated and raw
+		# TLS/SNI nodes alike.
+		awk -v wanted_domain="$DOMAIN" '
+			function trim(value) {
+				sub(/^[[:space:]]+/, "", value)
+				sub(/[[:space:]]+$/, "", value)
+				return value
+			}
+			function server_name_contains(line, domain, value, names, count, i) {
+				value = line
+				sub(/^[[:space:]]*server_name[[:space:]]+/, "", value)
+				sub(/;[[:space:]]*$/, "", value)
+				value = trim(value)
+				count = split(value, names, /[[:space:]]+/)
+				for (i = 1; i <= count; i++) {
+					if (names[i] == domain) {
+						return 1
+					}
+				}
+				return 0
+			}
+			function flush_server() {
+				if (!matched_domain) {
+					printf "%s", server_buffer
+				}
+				server_buffer = ""
+				matched_domain = 0
+				in_server = 0
+				depth = 0
+			}
+			BEGIN {
+				in_server = 0
+				depth = 0
+				server_buffer = ""
+				matched_domain = 0
+			}
+			{
+				line = $0
 
-		    server_tokens off;
-		    return 444;
-		}
+				if (!in_server && trim(line) == "# Public HTTP redirect for " wanted_domain ".") {
+					next
+				}
 
+				if (!in_server && line ~ /^[[:space:]]*server[[:space:]]*\{/) {
+					in_server = 1
+					depth = 0
+					server_buffer = ""
+					matched_domain = 0
+				}
+
+				if (in_server) {
+					server_buffer = server_buffer line "\n"
+					if (line ~ /^[[:space:]]*server_name[[:space:]]+/ \
+						&& server_name_contains(line, wanted_domain)) {
+						matched_domain = 1
+					}
+
+					opening = line
+					closing = line
+					open_count = gsub(/\{/, "", opening)
+					close_count = gsub(/\}/, "", closing)
+					depth += open_count - close_count
+
+					if (depth == 0) {
+						flush_server()
+					}
+					next
+				}
+
+				print line
+			}
+			END {
+				if (in_server) {
+					flush_server()
+				}
+			}
+		' "$wdr_target" > "$CURRENT_TMP" \
+			|| fatal "Could not merge the public HTTP redirect configuration."
+
+		# Keep one clean separator before the refreshed domain block.
+		printf '\n' >> "$CURRENT_TMP"
+	else
+		cat > "$CURRENT_TMP" <<- DOMAIN_REDIRECT_BASE
+			# nginx-manager: Public HTTP catch-all.
+			# Unknown Host headers are closed without returning content.
+			server {
+			    listen 80 default_server;
+			    ${IPV6_LISTEN_PREFIX}listen [::]:80 default_server;
+			    server_name _;
+
+			    server_tokens off;
+			    return 444;
+			}
+
+		DOMAIN_REDIRECT_BASE
+	fi
+
+	cat >> "$CURRENT_TMP" <<- DOMAIN_REDIRECT_SERVER
 		# Public HTTP redirect for $DOMAIN.
 		server {
 		    listen 80;
@@ -2046,7 +2131,7 @@ write_domain_redirect_80() {
 		    server_tokens off;
 		    include $NGINX_CONF_DIR/snippets/redirect_443.forcessl.conf;
 		}
-	DOMAIN_REDIRECT_80
+	DOMAIN_REDIRECT_SERVER
 
 	commit_nginx_file "$wdr_target" 0644 \
 		|| fatal "The generated domain redirect configuration failed validation."
@@ -2725,6 +2810,18 @@ collect_custom_parameters() {
 	done
 }
 
+validate_location_path() {
+	vlp_candidate=$1
+
+	if [ -n "$vlp_candidate" ]; then
+		unset vlp_candidate
+		return 0
+	fi
+
+	unset vlp_candidate
+	return 1
+}
+
 collect_custom_locations() {
 	ccl_forwarded_port=$1
 	LOCATION_FRAGMENT="$BACKUP_DIR/location-blocks.conf"
@@ -2850,7 +2947,7 @@ collect_custom_locations() {
 				if [ "$ccl_type" -eq 3 ]; then
 					cat >> "$LOCATION_FRAGMENT" <<- WEBSOCKET_HEADERS
 						        proxy_set_header Upgrade \$http_upgrade;
-						        proxy_set_header Connection \$$WS_MAP_VAR;
+						        proxy_set_header Connection "upgrade";
 						        proxy_buffering off;
 						        proxy_cache off;
 					WEBSOCKET_HEADERS
@@ -2957,7 +3054,7 @@ choose_proxy_layout() {
 
 				cat >> "$LOCATION_FRAGMENT" <<- SINGLE_PROXY_END
 					        proxy_set_header Upgrade \$http_upgrade;
-					        proxy_set_header Connection \$$WS_MAP_VAR;
+					        proxy_set_header Connection "upgrade";
 					    }
 				SINGLE_PROXY_END
 
@@ -2992,11 +3089,6 @@ write_https_site_config() {
 	cat >> "$CURRENT_TMP" <<- HTTPS_HEADER
 		# nginx-manager: HTTPS reverse-proxy virtual host for $DOMAIN.
 		# Host validation is intentionally strict.
-
-		map \$http_upgrade \$$WS_MAP_VAR {
-		    default upgrade;
-		    '' close;
-		}
 
 		server {
 		    $whsc_listen
@@ -3070,11 +3162,6 @@ write_custom_config() {
 	cat >> "$CURRENT_TMP" <<- CUSTOM_CONFIG
 		# nginx-manager: Custom-port HTTP/HTTPS reverse proxy for $DOMAIN.
 		# This file does not alter public port-80 or port-443 routing.
-
-		map \$http_upgrade \$$WS_MAP_VAR {
-		    default upgrade;
-		    '' close;
-		}
 
 		server {
 		    listen $HTTP_PORT;
@@ -3179,7 +3266,6 @@ configure_domain_mode() {
 		TLS_INTERNAL_PORT=$SELECTED_FREE_PORT
 		unset SELECTED_FREE_PORT
 
-		WS_MAP_VAR=$(websocket_map_variable "$DOMAIN")
 		log_success "Selected internal TLS listener port: $TLS_INTERNAL_PORT"
 
 		choose_proxy_layout 443
@@ -3206,7 +3292,7 @@ configure_domain_mode() {
 		unset cdm_token cdm_target cdm_listen
 	fi
 
-	unset WS_MAP_VAR LOCATION_FRAGMENT UPSTREAM_FRAGMENT
+	unset LOCATION_FRAGMENT UPSTREAM_FRAGMENT
 }
 
 configure_custom_port_mode() {
@@ -3252,7 +3338,6 @@ configure_custom_port_mode() {
 	fi
 
 	if [ "$TLS_PASSTHROUGH" -eq 0 ]; then
-		WS_MAP_VAR=$(websocket_map_variable "$DOMAIN")
 		choose_proxy_layout "$HTTPS_PORT"
 
 		ccpm_token=$(bounded_domain_token "$DOMAIN" 72)
@@ -3267,7 +3352,7 @@ configure_custom_port_mode() {
 		done
 
 		log_success "The custom-port HTTP/HTTPS configuration passed validation and was installed."
-		unset ccpm_token ccpm_target WS_MAP_VAR LOCATION_FRAGMENT UPSTREAM_FRAGMENT
+		unset ccpm_token ccpm_target LOCATION_FRAGMENT UPSTREAM_FRAGMENT
 	else
 		prompt_raw_tls_backend_port
 		ensure_stream_include
