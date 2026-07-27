@@ -100,14 +100,17 @@ static void select_certificate_paths(void) {
 	++count; \
 } while (0)
 	ADD_PAIR("%s/../letsencrypt/live/%s/fullchain.pem", "%s/../letsencrypt/live/%s/privkey.pem", app.nginx_conf_dir, app.domain);
-	ADD_PAIR("%s/certs/%s/fullchain.pem", "%s/certs/%s/privkey.pem", app.nginx_conf_dir, app.domain);
+	ADD_PAIR("%s/certs/%s.pem", "%s/certs/%s.key", app.nginx_conf_dir, app.domain);
 	ADD_PAIR("%s/certs/%s.crt", "%s/certs/%s.key", app.nginx_conf_dir, app.domain);
 	ADD_PAIR("%s/certs/%s.cer", "%s/certs/%s.key", app.nginx_conf_dir, app.domain);
 	ADD_PAIR("/etc/certs/%s/fullchain.pem", "/etc/certs/%s/privkey.pem", app.domain);
+	ADD_PAIR("/etc/certs/%s/%s.pem", "/etc/certs/%s/%s.key", app.domain, app.domain);
 	ADD_PAIR("/etc/certs/%s/%s.crt", "/etc/certs/%s/%s.key", app.domain, app.domain);
 	ADD_PAIR("/etc/certs/%s/%s.cer", "/etc/certs/%s/%s.key", app.domain, app.domain);
+	ADD_PAIR("%s/ssl/%s.pem", "%s/ssl/%s.key", app.nginx_conf_dir, app.domain);
 	ADD_PAIR("%s/ssl/%s.crt", "%s/ssl/%s.key", app.nginx_conf_dir, app.domain);
 	ADD_PAIR("%s/ssl/%s.cer", "%s/ssl/%s.key", app.nginx_conf_dir, app.domain);
+	ADD_PAIR("/etc/ssl/%s/%s.pem", "/etc/ssl/%s/%s.key", app.domain, app.domain);
 	ADD_PAIR("/etc/ssl/%s/%s.crt", "/etc/ssl/%s/%s.key", app.domain, app.domain);
 #undef ADD_PAIR
 	intS detected = 0;

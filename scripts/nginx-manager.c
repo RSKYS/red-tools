@@ -13,7 +13,7 @@
 #include "../modules/nm_transaction.c"
 #include "../modules/nm_validators.c"
 
-// nginx-manager.c
+// nginx-manager.c (Debian/Ubuntu)
 
 // Copyright 2026 Pouria Rezaei <Pouria.rz@outlook.com>
 // All rights reserved.
