@@ -10,13 +10,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-// port-scanner.c (Scan ports in the ip list)
+// port-scanner.c
 
 // Copyright 2026 Pouria Rezaei <Pouria.rz@outlook.com>
 // All rights reserved.
@@ -38,14 +39,10 @@
 //  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 //  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Warning: Risk of using this tool is all on you.
-
 #define MAX_QUEUE_CAPACITY 4224
 #define MAX_WORKERS 384
 #define MIN_QUEUE_CAPACITY 128
 #define DEFAULT_PARALLEL 5120
-#define FIRST_PORT 80
-#define SECND_PORT 443
 #define TIMEOUT_SECONDS 5
 #define PING_TIMEOUT 5
 
@@ -61,8 +58,20 @@ typedef struct {
 	pthread_cond_t not_full;
 } LineQueue;
 
+typedef enum {
+	PROTOCOL_TCP,
+	PROTOCOL_UDP
+} pProtocol;
+
+typedef struct {
+	int number;
+	pProtocol protocol;
+} PortSpec;
+
 typedef struct {
 	FILE *out;
+	const PortSpec *ports;
+	size_t port_count;
 	pthread_mutex_t io_mutex;
 } Context;
 
@@ -73,6 +82,11 @@ typedef struct {
 	bool output_owned;
 	int parallel;
 } Args;
+
+typedef struct {
+	PortSpec *items;
+	size_t count;
+} PortList;
 
 static void die_error(const char *msg)
 {
@@ -91,6 +105,14 @@ static void *xmalloc(size_t size)
 	void *p = malloc(size);
 	if (!p)
 		die_perror("error: malloc failure");
+	return p;
+}
+
+static void *xrealloc(void *ptr, size_t size)
+{
+	void *p = realloc(ptr, size);
+	if (!p)
+		die_perror("error: realloc failure");
 	return p;
 }
 
@@ -157,6 +179,150 @@ static char *prompt_path(const char *msg, bool must_exist)
 
 		return line;
 	}
+}
+
+static const char *ordinal_suffix(size_t value)
+{
+	size_t last_two = value % 100;
+	if (last_two >= 11 && last_two <= 13)
+		return "th";
+
+	switch (value % 10) {
+	case 1:
+		return "st";
+	case 2:
+		return "nd";
+	case 3:
+		return "rd";
+	default:
+		return "th";
+	}
+}
+
+static PortSpec prompt_port(size_t position)
+{
+	char *line = NULL;
+	size_t size = 0;
+
+	for (;;) {
+		printf("Enter the %zu%s port: ", position, ordinal_suffix(position));
+		fflush(stdout);
+
+		if (getline(&line, &size, stdin) < 0) {
+			free(line);
+			exit(1);
+		}
+
+		char *trimmed;
+		size_t len;
+		trim_in_place(line, &trimmed, &len);
+
+		if (len == 0) {
+			puts("Port cannot be empty.");
+			continue;
+		}
+
+		trimmed[len] = '\0';
+
+		pProtocol protocol = PROTOCOL_TCP;
+		char *slash = strchr(trimmed, '/');
+
+		if (slash) {
+			if (strchr(slash + 1, '/')) {
+				puts("Port must use the format NUMBER, NUMBER/tcp, or NUMBER/udp.");
+				continue;
+			}
+
+			*slash = '\0';
+			const char *protocol_name = slash + 1;
+
+			if (strcasecmp(protocol_name, "tcp") == 0) {
+				protocol = PROTOCOL_TCP;
+			} else if (strcasecmp(protocol_name, "udp") == 0) {
+				protocol = PROTOCOL_UDP;
+			} else {
+				puts("Protocol must be tcp or udp.");
+				continue;
+			}
+		}
+
+		errno = 0;
+		char *endptr = NULL;
+		long port = strtol(trimmed, &endptr, 10);
+
+		if (errno == ERANGE || *endptr != '\0' || port < 1 || port > 65535) {
+			puts("Port must be a number from 1 to 65535, optionally followed by /tcp or /udp.");
+			continue;
+		}
+
+		PortSpec result = {
+			.number = (int)port,
+			.protocol = protocol
+		};
+
+		free(line);
+		return result;
+	}
+}
+
+static bool prompt_another_port(size_t next_position)
+{
+	char *line = NULL;
+	size_t size = 0;
+
+	for (;;) {
+		printf("Add a %zu%s port? [y/N]: ",
+		       next_position,
+		       ordinal_suffix(next_position));
+		fflush(stdout);
+
+		if (getline(&line, &size, stdin) < 0) {
+			free(line);
+			exit(1);
+		}
+
+		char *trimmed;
+		size_t len;
+		trim_in_place(line, &trimmed, &len);
+
+		if (len == 0) {
+			free(line);
+			return false;
+		}
+
+		if ((len == 1 && (trimmed[0] == 'y' || trimmed[0] == 'Y')) ||
+		    (len == 3 && strncasecmp(trimmed, "yes", 3) == 0)) {
+			free(line);
+			return true;
+		}
+
+		if ((len == 1 && (trimmed[0] == 'n' || trimmed[0] == 'N')) ||
+		    (len == 2 && strncasecmp(trimmed, "no", 2) == 0)) {
+			free(line);
+			return false;
+		}
+
+		puts("Please answer y or n.");
+	}
+}
+
+static PortList prompt_ports(void)
+{
+	PortList ports = {
+		.items = NULL,
+		.count = 0
+	};
+
+	for (;;) {
+		ports.items = xrealloc(ports.items, (ports.count + 1) * sizeof(*ports.items));
+		ports.items[ports.count] = prompt_port(ports.count + 1);
+		ports.count++;
+
+		if (!prompt_another_port(ports.count + 1))
+			break;
+	}
+
+	return ports;
 }
 
 static Args parse_args(int argc, char **argv)
@@ -299,7 +465,95 @@ static bool tcp_port_responds(const char *ip, int port)
 	return error == 0;
 }
 
-static const char *check_ip(const char *ip)
+static bool udp_port_responds(const char *ip, int port)
+{
+	int sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0)
+		return false;
+
+	int flags = fcntl(sock, F_GETFL, 0);
+	if (flags < 0 || fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+		close(sock);
+		return false;
+	}
+
+	struct sockaddr_in addr = {0};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons((uint16_t)port);
+
+	if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+		close(sock);
+		return false;
+	}
+
+	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(sock);
+		return false;
+	}
+
+	const unsigned char probe = 0;
+	ssize_t sent = send(sock, &probe, sizeof(probe), 0);
+	if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+		close(sock);
+		return false;
+	}
+
+	struct pollfd pfd = {
+		.fd = sock,
+		.events = POLLIN | POLLERR,
+		.revents = 0
+	};
+
+	int result = poll(&pfd, 1, TIMEOUT_SECONDS * 1000);
+	if (result < 0) {
+		close(sock);
+		return false;
+	}
+
+	if (result == 0) {
+		close(sock);
+		return true;
+	}
+
+	int error = 0;
+	socklen_t error_len = sizeof(error);
+	if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &error_len) < 0) {
+		close(sock);
+		return false;
+	}
+
+	if (error != 0) {
+		close(sock);
+		return false;
+	}
+
+	if (pfd.revents & (POLLHUP | POLLNVAL)) {
+		close(sock);
+		return false;
+	}
+
+	if (pfd.revents & POLLIN) {
+		unsigned char response[1];
+		ssize_t received = recv(sock, response, sizeof(response), 0);
+		if (received < 0 && errno == ECONNREFUSED) {
+			close(sock);
+			return false;
+		}
+	}
+
+	close(sock);
+	return true;
+}
+
+static bool port_responds(const char *ip, const PortSpec *port)
+{
+	if (port->protocol == PROTOCOL_UDP)
+		return udp_port_responds(ip, port->number);
+
+	return tcp_port_responds(ip, port->number);
+}
+
+static const char *check_ip(const char *ip, const PortSpec *ports, size_t port_count)
 {
 	if (!valid_ipv4(ip))
 		return "SKIP invalid";
@@ -307,8 +561,10 @@ static const char *check_ip(const char *ip)
 	if (!ping_reachable(ip))
 		return "FAIL ping";
 
-	if (!tcp_port_responds(ip, FIRST_PORT) || !tcp_port_responds(ip, SECND_PORT))
-		return "FAIL PORTS";
+	for (size_t i = 0; i < port_count; i++) {
+		if (!port_responds(ip, &ports[i]))
+			return "FAIL PORTS";
+	}
 
 	return "OK";
 }
@@ -427,7 +683,7 @@ static void *worker(void *arg)
 		if (!ip)
 			break;
 
-		const char *status = check_ip(ip);
+		const char *status = check_ip(ip, ctx->ports, ctx->port_count);
 
 		pthread_mutex_lock(&ctx->io_mutex);
 		printf("[%s] %s\n", status, ip);
@@ -448,24 +704,33 @@ static void *worker(void *arg)
 int main(int argc, char **argv)
 {
 	Args args = parse_args(argc, argv);
+	PortList ports = prompt_ports();
 
 	FILE *in = fopen(args.input, "r");
 	if (!in) {
-		if (args.input_owned) free(args.input);
-		if (args.output_owned) free(args.output);
+		free(ports.items);
+		if (args.input_owned)
+			free(args.input);
+		if (args.output_owned)
+			free(args.output);
 		die_perror("error: input open failed");
 	}
 
 	FILE *out = fopen(args.output, "a");
 	if (!out) {
 		fclose(in);
-		if (args.input_owned) free(args.input);
-		if (args.output_owned) free(args.output);
+		free(ports.items);
+		if (args.input_owned)
+			free(args.input);
+		if (args.output_owned)
+			free(args.output);
 		die_perror("error: output open failed");
 	}
 
 	Context ctx;
 	ctx.out = out;
+	ctx.ports = ports.items;
+	ctx.port_count = ports.count;
 	if (pthread_mutex_init(&ctx.io_mutex, NULL) != 0)
 		die_perror("error: pthread_mutex_init");
 
@@ -535,6 +800,8 @@ int main(int argc, char **argv)
 	pthread_mutex_destroy(&ctx.io_mutex);
 	fclose(out);
 	fclose(in);
+
+	free(ports.items);
 
 	if (args.input_owned)
 		free(args.input);
