@@ -96,7 +96,7 @@ def signal_exit(_signum: int, _frame: object) -> None:
 	raise SystemExit(1)
 
 
-def systemd_quote(value: str) -> str:
+def some_quote(value: str) -> str:
 	return value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
 
 
@@ -177,9 +177,9 @@ def write_systemd(
 	target = SYSTEMD_DIR / unit
 	confirm_overwrite(target)
 
-	description_q = systemd_quote(description)
-	directory_q = systemd_quote(directory)
-	executable_q = systemd_quote(executable)
+	description_q = some_quote(description)
+	directory_q = some_quote(directory)
+	executable_q = executable
 	tmp = Path(f"{target}.tmp.{os.getpid()}")
 	backup = None
 
@@ -465,7 +465,7 @@ def read_arguments(executable: str, initial_args: str = "") -> tuple[str, str, s
 
 	if initial_args:
 		for arg in shlex.split(initial_args):
-			systemd_args += f' "{systemd_quote(arg)}"'
+			systemd_args += f' "{some_quote(arg)}"'
 			quoted = shell_quote(arg)
 			openrc_arguments.append(quoted)
 			helper_parts.append(quoted)
@@ -484,7 +484,7 @@ def read_arguments(executable: str, initial_args: str = "") -> tuple[str, str, s
 		if not answer:
 			break
 
-		systemd_args += f' "{systemd_quote(answer)}"'
+		systemd_args += f' "{some_quote(answer)}"'
 		quoted = shell_quote(answer)
 		openrc_arguments.append(quoted)
 		helper_parts.append(quoted)
