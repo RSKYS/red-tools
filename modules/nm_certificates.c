@@ -92,11 +92,13 @@ static void bootstrap_certificate_pair(void) {
 }
 
 static void select_certificate_paths(void) {
-	char pairs[10][2][PATH_MAX];
+	char pairs[13][2][PATH_MAX];
 	size_t count = 0;
 #define ADD_PAIR(certfmt, keyfmt, ...) do { \
-	str_printf(pairs[count][0], PATH_MAX, certfmt, __VA_ARGS__); \
-	str_printf(pairs[count][1], PATH_MAX, keyfmt, __VA_ARGS__); \
+	if (count >= ARRAY_LEN(pairs)) \
+		fatalf("Internal error: certificate candidate capacity exceeded."); \
+	str_printf(pairs[count][0], sizeof(pairs[count][0]), certfmt, __VA_ARGS__); \
+	str_printf(pairs[count][1], sizeof(pairs[count][1]), keyfmt, __VA_ARGS__); \
 	++count; \
 } while (0)
 	ADD_PAIR("%s/../letsencrypt/live/%s/fullchain.pem", "%s/../letsencrypt/live/%s/privkey.pem", app.nginx_conf_dir, app.domain);

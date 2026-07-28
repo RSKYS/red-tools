@@ -39,12 +39,16 @@
 //  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 //  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#define MAX_QUEUE_CAPACITY 4224
-#define MAX_WORKERS 384
+// Warning: Risk of using this tool is all on you.
+
+typedef short int intS;
+
+#define MAX_QUEUE_CAPACITY 1024
+#define MAX_WORKERS 64
 #define MIN_QUEUE_CAPACITY 128
-#define DEFAULT_PARALLEL 5120
-#define TIMEOUT_SECONDS 5
-#define PING_TIMEOUT 5
+#define DEFAULT_PARALLEL 32
+#define TIMEOUT_SECONDS 3
+#define PING_TIMEOUT 2
 
 typedef struct {
 	char **items;
@@ -80,7 +84,7 @@ typedef struct {
 	char *output;
 	bool input_owned;
 	bool output_owned;
-	int parallel;
+	intS parallel;
 } Args;
 
 typedef struct {
@@ -344,13 +348,13 @@ static Args parse_args(int argc, char **argv)
 			long val = strtol(argv[i], &endptr, 10);
 			if (*endptr != '\0' || val < 1)
 				die_error("error: invalid --parallel numerical value");
-			args.parallel = (int)val;
+			args.parallel = val > MAX_WORKERS ? MAX_WORKERS : (intS)val;
 		} else if (!strncmp(argv[i], "--parallel=", 11)) {
 			char *endptr;
 			long val = strtol(argv[i] + 11, &endptr, 10);
 			if (*endptr != '\0' || val < 1)
 				die_error("error: invalid --parallel numerical value");
-			args.parallel = (int)val;
+			args.parallel = val > MAX_WORKERS ? MAX_WORKERS : (intS)val;
 		} else if (argv[i][0] == '-') {
 			die_error("error: unrecognized arguments");
 		} else if (!args.input) {
@@ -436,7 +440,7 @@ static bool tcp_port_responds(const char *ip, int port)
 		return false;
 	}
 
-	int result = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+	intS result = (intS)connect(sock, (struct sockaddr *)&addr, sizeof(addr));
 	if (result < 0 && errno != EINPROGRESS) {
 		close(sock);
 		return false;
@@ -448,7 +452,7 @@ static bool tcp_port_responds(const char *ip, int port)
 		.revents = 0
 	};
 
-	result = poll(&pfd, 1, TIMEOUT_SECONDS * 1000);
+	result = (intS)poll(&pfd, 1, TIMEOUT_SECONDS * 1000);
 	if (result <= 0) {
 		close(sock);
 		return false;
@@ -504,7 +508,7 @@ static bool udp_port_responds(const char *ip, int port)
 		.revents = 0
 	};
 
-	int result = poll(&pfd, 1, TIMEOUT_SECONDS * 1000);
+	intS result = (intS)poll(&pfd, 1, TIMEOUT_SECONDS * 1000);
 	if (result < 0) {
 		close(sock);
 		return false;
@@ -512,7 +516,7 @@ static bool udp_port_responds(const char *ip, int port)
 
 	if (result == 0) {
 		close(sock);
-		return true;
+		return false;
 	}
 
 	int error = 0;
@@ -532,13 +536,16 @@ static bool udp_port_responds(const char *ip, int port)
 		return false;
 	}
 
-	if (pfd.revents & POLLIN) {
-		unsigned char response[1];
-		ssize_t received = recv(sock, response, sizeof(response), 0);
-		if (received < 0 && errno == ECONNREFUSED) {
-			close(sock);
-			return false;
-		}
+	if (!(pfd.revents & POLLIN)) {
+		close(sock);
+		return false;
+	}
+
+	unsigned char response[1];
+	ssize_t received = recv(sock, response, sizeof(response), 0);
+	if (received < 0) {
+		close(sock);
+		return false;
 	}
 
 	close(sock);
@@ -561,12 +568,14 @@ static const char *check_ip(const char *ip, const PortSpec *ports, size_t port_c
 	if (!ping_reachable(ip))
 		return "FAIL ping";
 
+	bool all_ports_respond = port_count > 0;
+
 	for (size_t i = 0; i < port_count; i++) {
 		if (!port_responds(ip, &ports[i]))
-			return "FAIL PORTS";
+			all_ports_respond = false;
 	}
 
-	return "OK";
+	return all_ports_respond ? "OK" : "FAIL";
 }
 
 static void queue_init(LineQueue *q, size_t capacity)
