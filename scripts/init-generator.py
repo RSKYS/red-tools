@@ -54,10 +54,22 @@ helper_backup: Path | None = None
 
 
 class ScriptError(Exception):
+    pass
 
 
 def die(message: str) -> None:
     raise ScriptError(message)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        die("Administrator privileges are required; rerun this script with sudo")
+
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        print(f"Privilege check: running as root through sudo (user: {sudo_user}).", file=sys.stderr)
+    else:
+        print("Privilege check: running as root.", file=sys.stderr)
 
 
 def ask(prompt: str) -> str:
@@ -509,16 +521,16 @@ def read_restart_delay() -> str:
 def main() -> None:
     if sys.version_info < (3, 11):
         die("Python 3.11 or newer is required")
-    if os.geteuid() != 0:
-        die("this script must be run as root (use sudo)")
+    require_root()
     if len(sys.argv) != 1:
         die("this script accepts no arguments")
 
     init = detect_init()
+    print(f"Detected init system: {init}", file=sys.stderr)
     service = read_service_name()
 
-    answer = ask("Description [My Go Application]: ")
-    description = answer or "My Go Application"
+    answer = ask("Description [My Application]: ")
+    description = answer or "My Application"
 
     directory = read_directory()
     executable = read_executable()
