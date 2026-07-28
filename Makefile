@@ -28,6 +28,9 @@ install: build
 					-Wstrict-prototypes \
 				"$$script" -o "$(DESTDIR)$(BIN_PATH)/$$basename"
 				;;
+			*.py)
+				install -m 755 "$$script" "$(DESTDIR)$(BIN_PATH)/$$basename"
+				;;
 			*.sh)
 				install -m 755 "$$script" "$(DESTDIR)$(BIN_PATH)/$$basename"
 				;;
