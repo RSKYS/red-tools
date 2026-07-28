@@ -31,19 +31,12 @@ import shutil
 import signal
 import subprocess
 import sys
+import shlex
 
 PROGRAM = Path(sys.argv[0]).name
 SYSTEMD_DIR = Path("/etc/systemd/system")
 OPENRC_DIR = Path("/etc/init.d")
 HELPER_DIR = Path("/usr/local/libexec")
-SEARCH_PATHS = (
-    Path("/usr/local/bin"),
-    Path("/usr/local/sbin"),
-    Path("/usr/bin"),
-    Path("/usr/sbin"),
-    Path("/bin"),
-    Path("/sbin"),
-)
 
 os.umask(0o022)
 
@@ -63,7 +56,7 @@ def die(message: str) -> None:
 
 def require_root() -> None:
     if os.geteuid() != 0:
-        die("Administrator privileges are required; rerun this script with sudo")
+        die("administrator privileges are required; rerun this script with sudo")
 
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user and sudo_user != "root":
@@ -160,12 +153,7 @@ def resolve_executable(requested: str) -> str | None:
     if "/" in requested:
         return None
 
-    for directory in SEARCH_PATHS:
-        path = directory / requested
-        if path.is_file() and os.access(path, os.X_OK):
-            return str(path)
-
-    return None
+    return shutil.which(requested)
 
 
 def verify_shell_script(path: Path, description: str) -> None:
@@ -204,7 +192,7 @@ def write_systemd(
             f'''[Service]\n'''
             f'''Type=simple\n'''
             f'''User=root\n'''
-            f'''WorkingDirectory="{directory_q}"\n'''
+            f'''WorkingDirectory={directory_q}\n'''
             f'''ExecStart="{executable_q}"{systemd_args}\n'''
             f'''Restart={restart}\n'''
             f'''RestartSec={delay}\n'''
@@ -454,32 +442,45 @@ def read_directory() -> str:
         )
 
 
-def read_executable() -> str:
+def read_executable() -> tuple[str, str]:
     while True:
         answer = ask("Executable path or command name (for example: go): ")
-        executable = resolve_executable(answer) if answer else None
-        if executable is not None:
-            return executable
-
         if not answer:
             sys.stderr.write("Executable cannot be empty.\n")
             continue
 
+        parts = answer.split(maxsplit=1)
+        cmd = parts[0]
+        args = parts[1] if len(parts) > 1 else ""
+
+        executable = resolve_executable(cmd)
+        if executable is not None:
+            return executable, args
+
         sys.stderr.write(
             "Executable was not found or is not executable.\n"
-            "Bare command names are searched only in:\n"
-            "  /usr/local/bin /usr/local/sbin /usr/bin /usr/sbin /bin /sbin\n"
         )
 
 
-def read_arguments(executable: str) -> tuple[str, str, str]:
+def read_arguments(executable: str, initial_args: str = "") -> tuple[str, str, str]:
     systemd_args = ""
     openrc_arguments: list[str] = []
     helper_parts = [shell_quote(executable)]
     number = 1
 
+    if initial_args:
+        for arg in shlex.split(initial_args):
+            systemd_args += f' "{systemd_quote(arg)}"'
+            quoted = shell_quote(arg)
+            openrc_arguments.append(quoted)
+            helper_parts.append(quoted)
+            number += 1
+
+    if number > 1:
+        sys.stderr.write(f"Detected {number - 1} initial argument(s).\n")
+
     sys.stderr.write(
-        "Enter executable arguments one at a time.\n"
+        "Enter additional executable arguments one at a time.\n"
         "Leave an argument empty to finish.\n"
     )
 
@@ -533,8 +534,8 @@ def main() -> None:
     description = answer or "My Application"
 
     directory = read_directory()
-    executable = read_executable()
-    systemd_args, openrc_args, helper_command = read_arguments(executable)
+    executable, initial_args = read_executable()
+    systemd_args, openrc_args, helper_command = read_arguments(executable, initial_args)
     restart = read_restart_policy()
     delay = read_restart_delay()
 
