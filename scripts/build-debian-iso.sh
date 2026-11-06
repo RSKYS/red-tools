@@ -38,7 +38,7 @@
 #
 
 set -eu
-umask 077
+umask 022
 
 CWD=$(pwd -P)
 OUTPUT_ISO=${OUTPUT_ISO:-$CWD/debian-live-server_red.iso}
@@ -53,7 +53,8 @@ TARGET_DOMAIN=${TARGET_DOMAIN:-}
 TARGET_DISK=${TARGET_DISK:-}
 AUTHORIZE_DESTRUCTIVE_INSTALL=${AUTHORIZE_DESTRUCTIVE_INSTALL:-NO}
 CHECK_ONLY=${CHECK_ONLY:-0}
-BOOT_TIMEOUT_SECONDS=${BOOT_TIMEOUT_SECONDS:-5}
+LIVE_BOOT_TIMEOUT_SECONDS=30
+SQUASHFS_COMPRESSION_LEVEL=3
 
 DEBIAN_MIRROR=https://deb.debian.org/debian
 SECURITY_MIRROR=https://security.debian.org/debian-security
@@ -61,8 +62,6 @@ KEYRING=/usr/share/keyrings/debian-archive-keyring.gpg
 MIN_FREE_KB=20000000
 MIN_ISO_BYTES=104857600
 LOGGING=0
-
-# ---- Helpers ----------------------------------------------------------------
 
 fail()
 {
@@ -145,6 +144,58 @@ verify_inrelease()
 		fail "The $3 InRelease signature could not be verified."
 }
 
+verify_acl_support()
+{
+	_acl_root=$WORKSPACE_DIR/.acl-roundtrip.$$
+	_acl_source=$_acl_root/source
+	_acl_image=$_acl_root/probe.squashfs
+	_acl_unpacked=$_acl_root/unpacked
+	_acl_log=$_acl_root/mksquashfs.log
+
+	mkdir -m 700 "$_acl_root" ||
+		fail "Cannot create the ACL verification workspace."
+	mkdir -m 700 "$_acl_source" ||
+		fail "Cannot create the ACL verification source directory."
+	printf 'ACL metadata probe\n' > "$_acl_source/probe"
+	chmod 600 "$_acl_source/probe" ||
+		fail "Cannot prepare the ACL verification file."
+
+	if ! setfacl -m u:65534:r-- "$_acl_source/probe"; then
+		fail "The build workspace filesystem does not support POSIX ACLs. Move WORKSPACE_DIR to a filesystem mounted with ACL support (for example ext4, XFS or Btrfs with ACLs enabled); ACL metadata will not be silently discarded."
+	fi
+	getfacl -ncp "$_acl_source/probe" |
+		grep -Fxq 'user:65534:r--' ||
+		fail "The workspace filesystem did not retain the test POSIX ACL."
+
+	MKSQUASHFS_HELP=$(LC_ALL=C mksquashfs -help 2>&1 || :)
+	case $MKSQUASHFS_HELP in
+		*zstd*) ;;
+		*) fail "The installed mksquashfs does not support Zstandard compression." ;;
+	esac
+	case $MKSQUASHFS_HELP in
+		*-xattrs*) ;;
+		*) fail "The installed mksquashfs does not support extended attributes; ACL metadata cannot be preserved." ;;
+	esac
+
+	if ! mksquashfs "$_acl_source" "$_acl_image" -noappend \
+		-comp zstd -Xcompression-level "$SQUASHFS_COMPRESSION_LEVEL" \
+		-xattrs -processors 1 > "$_acl_log" 2>&1; then
+		tail -n 40 "$_acl_log" >&2 2>/dev/null || :
+		fail "SquashFS could not create the ACL/Zstandard round-trip test image."
+	fi
+	if ! unsquashfs -d "$_acl_unpacked" "$_acl_image" >> "$_acl_log" 2>&1; then
+		tail -n 40 "$_acl_log" >&2 2>/dev/null || :
+		fail "SquashFS could not extract the ACL/Zstandard round-trip test image."
+	fi
+	getfacl -ncp "$_acl_unpacked/probe" |
+		grep -Fxq 'user:65534:r--' ||
+		fail "SquashFS did not preserve POSIX ACL metadata through compression and extraction."
+
+	rm -rf "$_acl_root" ||
+		fail "Cannot remove the successful ACL verification workspace."
+	say "Verified POSIX ACL support on the workspace filesystem and ACL preservation by SquashFS (zstd, level $SQUASHFS_COMPRESSION_LEVEL, xattrs enabled)."
+}
+
 iso_report()
 {
 	_name=$1
@@ -192,10 +243,8 @@ require_distinct()
 	fi
 }
 
-# ---- Host and parameter validation ------------------------------------------
-
 require_cmds id dpkg grep awk sed df dirname mkdir wc tr tail date uname cat \
-	cp mv rm chmod mktemp sha256sum readlink
+	cp mv rm chmod mktemp sha256sum readlink stat
 
 [ "$(id -u)" -eq 0 ] || fail "Run this script as root."
 [ -r /etc/os-release ] || fail "Cannot identify the build host OS."
@@ -215,7 +264,6 @@ done
 case $OUTPUT_ISO in */) fail "OUTPUT_ISO must name a file, not a directory." ;; esac
 case $LOG_FILE in */) fail "LOG_FILE must name a file, not a directory." ;; esac
 
-# Collision checks run before the log is opened, so LOG_FILE can never alias an output.
 require_distinct OUTPUT_ISO "$OUTPUT_ISO" LOG_FILE "$LOG_FILE"
 require_distinct OUTPUT_ISO "$OUTPUT_ISO" OUTPUT_ISO.sha256 "$ISO_SHA_FILE"
 require_distinct OUTPUT_ISO "$OUTPUT_ISO" OUTPUT_ISO.provenance.txt "$ISO_PROVENANCE"
@@ -228,17 +276,11 @@ case $LOCALE in ''|*[!A-Za-z0-9_.@-]*) fail "Invalid LOCALE." ;; esac
 case $KEYMAP in ''|*[!A-Za-z0-9_-]*) fail "Invalid KEYMAP." ;; esac
 case $TIMEZONE in ''|/*|*..*|*[!A-Za-z0-9_+./-]*) fail "Invalid TIMEZONE." ;; esac
 
-case $BOOT_TIMEOUT_SECONDS in ''|*[!0-9]*) fail "BOOT_TIMEOUT_SECONDS must be a whole number of seconds." ;; esac
-if [ "$BOOT_TIMEOUT_SECONDS" -lt 1 ] || [ "$BOOT_TIMEOUT_SECONDS" -gt 600 ]; then
-	fail "BOOT_TIMEOUT_SECONDS must be between 1 and 600."
-fi
-
 if [ -n "$TARGET_HOSTNAME" ]; then
 	case $TARGET_HOSTNAME in -*|*-|*[!a-zA-Z0-9-]*) fail "Invalid TARGET_HOSTNAME." ;; esac
 	[ "${#TARGET_HOSTNAME}" -le 63 ] || fail "TARGET_HOSTNAME is too long."
 fi
 
-# Domain labels: letters, digits and hyphens; no empty labels; no leading or trailing hyphen or dot.
 if [ -n "$TARGET_DOMAIN" ]; then
 	case $TARGET_DOMAIN in
 		-*|*-|.*|*.|*..*|*.-*|*-.*|*[!a-zA-Z0-9.-]*) fail "Invalid TARGET_DOMAIN." ;;
@@ -276,8 +318,6 @@ if [ "$CHECK_ONLY" = 1 ]; then
 	exit 0
 fi
 
-# ---- Logging and workspace --------------------------------------------------
-
 [ ! -L "$LOG_FILE" ] || fail "Refusing to write through a symbolic-link log path: $LOG_FILE."
 if [ -e "$LOG_FILE" ] && [ ! -f "$LOG_FILE" ]; then
 	fail "Log path is not a regular file: $LOG_FILE."
@@ -297,10 +337,13 @@ if [ -n "$WORKSPACE_DIR" ]; then
 	if path_exists "$WORKSPACE_DIR"; then
 		fail "Refusing to reuse existing workspace $WORKSPACE_DIR."
 	fi
-	mkdir -m 700 "$WORKSPACE_DIR"
+	mkdir -m 755 "$WORKSPACE_DIR"
 else
 	WORKSPACE_DIR=$(mktemp -d "$CWD/.debian-live-build.XXXXXX")
 fi
+chmod 755 "$WORKSPACE_DIR" || fail "Cannot set the build workspace mode to 755."
+[ "$(stat -c '%a' "$WORKSPACE_DIR")" = 755 ] ||
+	fail "Build workspace must be mode 755: $WORKSPACE_DIR."
 
 trap cleanup 0
 trap 'exit 129' HUP
@@ -313,16 +356,15 @@ say "Workspace: $WORKSPACE_DIR"
 say "Output ISO: $OUTPUT_ISO"
 say "Target network configuration will be discovered only by the installer."
 
-# ---- Build dependencies and repository verification -------------------------
-
 export DEBIAN_FRONTEND=noninteractive
 run apt-get update
 run apt-get install -y --no-install-recommends \
 	live-build debootstrap xorriso isolinux syslinux-common \
 	grub-pc-bin grub-efi-amd64-bin mtools dosfstools squashfs-tools \
-	curl ca-certificates debian-archive-keyring gnupg gpgv rsync xz-utils
+	acl cpio curl ca-certificates debian-archive-keyring gnupg gpgv rsync xz-utils
 
-require_cmds lb debootstrap xorriso curl gpgv
+require_cmds lb debootstrap xorriso curl gpgv mksquashfs unsquashfs \
+	setfacl getfacl cpio gzip chroot stat
 
 LB_VERSION=$(dpkg-query -W -f='${Version}' live-build)
 LB_HELP=$(lb config --help 2>&1) || fail "Cannot query live-build options."
@@ -330,6 +372,23 @@ case $LB_HELP in
 	*--debian-installer-gui*) ;;
 	*) fail "Installed live-build lacks --debian-installer-gui support." ;;
 esac
+case $LB_HELP in
+	*--chroot-squashfs-compression-type*) ;;
+	*) fail "Installed live-build lacks --chroot-squashfs-compression-type support required for Zstandard SquashFS." ;;
+esac
+case $LB_HELP in
+	*--chroot-filesystem*) ;;
+	*) fail "Installed live-build lacks --chroot-filesystem support required to select SquashFS explicitly." ;;
+esac
+case $LB_HELP in
+	*--chroot-squashfs-compression-level*) ;;
+	*) fail "Installed live-build lacks --chroot-squashfs-compression-level support." ;;
+esac
+
+verify_acl_support
+[ -z "${MKSQUASHFS_OPTIONS:-}" ] ||
+	fail "MKSQUASHFS_OPTIONS is set in the build environment. Unset it so live-build's explicit Zstandard settings and SquashFS extended-attribute defaults cannot be overridden."
+unset MKSQUASHFS_OPTIONS
 
 verify_inrelease "$DEBIAN_MIRROR/dists/$DEBIAN_SUITE/InRelease" source "Debian suite"
 
@@ -344,13 +403,12 @@ say "Resolved Debian suite: $DEBIAN_SUITE ($CODENAME)"
 say "live-build version: $LB_VERSION"
 cd "$WORKSPACE_DIR"
 
-# ---- live-build configuration -----------------------------------------------
-
-# Use root for the live console autologin. Disable cloud-init only for this live boot:
-# the live image does not need cloud metadata discovery, which can delay startup.
 BOOTAPPEND_LIVE="boot=live components username=root cloud-init=disabled systemd.mask=systemd-networkd-wait-online.service quiet"
 BOOTAPPEND_INSTALL="auto=true priority=critical preseed/file=/cdrom/preseed.cfg"
-ISO_VOLUME="CUSTOM-DEBIAN-${CODENAME}-AMD64"
+ISO_VOLUME=$(printf 'DEBIAN_%s' "$CODENAME" | tr '[:lower:]' '[:upper:]')
+case $ISO_VOLUME in ''|*[!A-Z0-9_]*) fail "Invalid ISO volume ID: $ISO_VOLUME" ;; esac
+[ "${#ISO_VOLUME}" -le 16 ] ||
+	fail "ISO volume ID exceeds 16 characters: $ISO_VOLUME."
 
 run lb config \
 	--mode debian \
@@ -365,6 +423,9 @@ run lb config \
 	--mirror-binary-security "$SECURITY_MIRROR" \
 	--linux-flavours amd64 \
 	--binary-images iso-hybrid \
+	--chroot-filesystem squashfs \
+	--chroot-squashfs-compression-type zstd \
+	--chroot-squashfs-compression-level "$SQUASHFS_COMPRESSION_LEVEL" \
 	--bootloader "syslinux,grub-efi" \
 	--debian-installer live \
 	--debian-installer-gui true \
@@ -391,9 +452,9 @@ mkdir -p config/package-lists config/includes.chroot/etc/netplan \
 	config/hooks/normal config/includes.binary config/bootloaders/isolinux config/bootloaders/grub-pc
 
 cat > config/package-lists/custom-standard.list.chroot <<'PACKAGES'
-bcache-tools
 byobu
 ca-certificates
+cloud-init
 cryptsetup
 curl
 dosfstools
@@ -408,11 +469,7 @@ live-config
 live-config-systemd
 live-task-standard
 live-tools
-multipath-tools
 netplan.io
-open-iscsi
-openssh-server
-overlayroot
 parted
 pciutils
 python-is-python3
@@ -430,8 +487,6 @@ wget
 zstd
 PACKAGES
 
-# cloud-init is installed on the target by pkgsel, not in the live root, to avoid its boot-time probes.
-# Static Netplan for the live system. The installed system gets its own from the installer hook.
 put 600 config/includes.chroot/etc/netplan/50-cloud-init.yaml <<'NETPLAN'
 network:
   version: 2
@@ -472,7 +527,32 @@ for unit in systemd-networkd systemd-resolved systemd-timesyncd; do
 done
 HOOK
 
-# Live-root hook: adds Fastfetch to /etc/profile after package installation
+put 755 config/hooks/normal/0150-scrub-live-ssh-host-keys.hook.chroot <<'HOOK'
+#!/bin/sh
+set -eu
+
+if dpkg-query -W -f='${db:Status-Status}' openssh-server 2>/dev/null | grep -Fxq installed; then
+	printf '%s\n' "ERROR: openssh-server unexpectedly entered the live root; remove it from the live package dependency chain." >&2
+	exit 1
+fi
+if [ -x /usr/sbin/sshd ]; then
+	printf '%s\n' "ERROR: sshd is present in the live root; refusing to create an ISO containing a live SSH server." >&2
+	exit 1
+fi
+if [ -d /etc/ssh ]; then
+	for _key in /etc/ssh/ssh_host_*; do
+		[ -e "$_key" ] || [ -L "$_key" ] || continue
+		rm -f "$_key"
+	done
+	for _key in /etc/ssh/ssh_host_*; do
+		[ ! -e "$_key" ] && [ ! -L "$_key" ] || {
+			printf '%s\n' "ERROR: an SSH host key remains in the live root." >&2
+			exit 1
+		}
+	done
+fi
+HOOK
+
 put 755 config/hooks/normal/0200-fastfetch-profile.hook.chroot <<'HOOK'
 #!/bin/sh
 set -eu
@@ -505,7 +585,6 @@ if ! awk '
 	exit 1
 fi
 
-# Write through the existing file to preserve its ownership and permissions.
 if ! cat "$TMP_PROFILE" > "$PROFILE"; then
 	rm -f "$TMP_PROFILE"
 	printf '%s\n' "Cannot update $PROFILE." >&2
@@ -514,20 +593,68 @@ fi
 rm -f "$TMP_PROFILE"
 HOOK
 
-# Target network hook: convert discovered installer network state into static Netplan.
-# If discovery is incomplete, preserve the existing DHCP configuration instead.
+put 755 config/hooks/normal/0300-standard-directory-modes.hook.chroot <<'HOOK'
+#!/bin/sh
+set -eu
+
+for _dir in / /etc /usr /usr/bin /usr/sbin /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/systemd /usr/lib/systemd/system /usr/share /var /var/log; do
+	[ -d "$_dir" ] && [ ! -L "$_dir" ] || {
+		printf 'ERROR: expected a real live-root directory: %s\n' "$_dir" >&2
+		exit 1
+	}
+	chmod 755 "$_dir" || {
+		printf 'ERROR: cannot set live-root directory mode 755: %s\n' "$_dir" >&2
+		exit 1
+	}
+done
+HOOK
+
+put 644 config/includes.binary/debian-live-server-timeout.sh <<'TIMEOUT_HELPER'
+#!/bin/sh
+verify_busybox_timeout()
+{
+	_bb=$(command -v busybox 2>/dev/null) || {
+		printf '%s\n' "TIMEOUT ERROR: BusyBox is missing from the Debian Installer environment; use the current Trixie installer initrd." >&2
+		return 127
+	}
+	"$_bb" timeout 1 "$_bb" true </dev/null >/dev/null 2>&1 || {
+		printf '%s\n' "TIMEOUT ERROR: Debian Installer BusyBox has no working timeout applet; use a Trixie busybox-udeb with CONFIG_TIMEOUT enabled. No unbounded command was run." >&2
+		return 127
+	}
+}
+
+run_with_timeout()
+{
+	_rwt_limit=$1
+	shift
+	verify_busybox_timeout || return 127
+	_rwt_busybox=$(command -v busybox 2>/dev/null) || return 127
+	"$_rwt_busybox" timeout "$_rwt_limit" "$@" </dev/null
+}
+
+in_target()
+{
+	_it_limit=$1
+	shift
+	run_with_timeout "$_it_limit" in-target "$@"
+}
+
+bounded()
+{
+	_b_limit=$1
+	shift
+	run_with_timeout "$_b_limit" "$@"
+}
+TIMEOUT_HELPER
+
 put 755 config/includes.binary/debian-live-server-target-system.sh <<'SYSTEM_HOOK'
 #!/bin/sh
-#
-# debian-live-server-target-system.sh
-# Apply target-wide settings as independent steps; one optional setting must not
-# prevent the remaining post-install configuration from being attempted.
-#
 set -u
 umask 077
 
 TARGET_ROOT=${TARGET_ROOT:-/target}
-SYSCTL_SOURCE=${SYSCTL_SOURCE:-/cdrom/sysctl.conf}
+HOOK_DIR=${HOOK_DIR:-/cdrom}
+SYSCTL_SOURCE=${SYSCTL_SOURCE:-$HOOK_DIR/sysctl.conf}
 
 [ -d "$TARGET_ROOT/etc" ] || {
 	printf 'SYSTEM CONFIGURATION ERROR: target is not mounted at %s.\n' "$TARGET_ROOT" >&2
@@ -538,6 +665,12 @@ exec >> "$TARGET_ROOT/var/log/debian-live-server-system.log" 2>&1
 printf 'Starting target system configuration at %s.\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 failed=0
+[ -r "$HOOK_DIR/debian-live-server-timeout.sh" ] || {
+	printf '%s\n' "TIMEOUT ERROR: shared timeout helper is missing from $HOOK_DIR." >&2
+	exit 127
+}
+. "$HOOK_DIR/debian-live-server-timeout.sh"
+verify_busybox_timeout || exit 127
 
 run_step()
 {
@@ -555,7 +688,6 @@ run_step()
 
 configure_cloud_init()
 {
-	# cloud-init is optional at runtime; if installed, stop it from replacing Netplan.
 	if [ ! -d "$TARGET_ROOT/etc/cloud" ]; then
 		printf 'cloud-init configuration directory is absent; no cloud-init network override is needed.\n'
 		return 0
@@ -679,15 +811,19 @@ enable_network_services()
 	}
 	_service_failed=0
 	for _unit in systemd-networkd systemd-resolved systemd-timesyncd; do
-		if ! in-target systemctl enable "$_unit.service"; then
+		if ! in_target 60 systemctl --root=/ enable "$_unit.service"; then
 			printf 'Could not enable %s.service.\n' "$_unit"
 			_service_failed=1
 		fi
 	done
+	if ! in_target 60 systemctl --root=/ mask systemd-networkd-wait-online.service; then
+		printf 'Could not mask systemd-networkd-wait-online.service.\n'
+		_service_failed=1
+	fi
 	for _unit in NetworkManager networking; do
 		if [ -e "$TARGET_ROOT/usr/lib/systemd/system/$_unit.service" ] ||
 		   [ -e "$TARGET_ROOT/lib/systemd/system/$_unit.service" ]; then
-			if ! in-target systemctl mask "$_unit.service"; then
+			if ! in_target 60 systemctl --root=/ mask "$_unit.service"; then
 				printf 'Could not mask conflicting %s.service.\n' "$_unit"
 				_service_failed=1
 			fi
@@ -713,29 +849,12 @@ SYSTEM_HOOK
 
 put 755 config/includes.binary/debian-live-server-target-network.sh <<'NETWORK_HOOK'
 #!/bin/sh
-#
-# debian-live-server-target-network.sh
-#
-# Preseed late_command, run by the Debian Installer as /cdrom/debian-live-server-target-network.sh.
-# Discovers every link that holds a global IPv4 address, classifies each as Ethernet,
-# Wi-Fi, VLAN, or unsupported, and writes one authoritative Netplan file for the
-# installed system: $TARGET_ROOT/etc/netplan/50-cloud-init.yaml (mode 600).
-#
-# Limits:
-#   - The installer configures only the interface it chose. Only links that already
-#     hold IPv4 addresses in the installer environment can be carried over.
-#   - Wi-Fi credentials come from the installer's wpa_supplicant.conf. The installer
-#     cannot read the live session's stored secrets.
-#   - Every DHCP-derived address must be reserved by an administrator in DHCP/IPAM.
-#     This script cannot create reservations.
-#
 set -eu
 umask 077
 
-# SYSROOT is empty on a real installer. It exists so that tests can point discovery
-# at a fixture tree.
 SYSROOT=${SYSROOT:-}
 TARGET_ROOT=${TARGET_ROOT:-/target}
+HOOK_DIR=${HOOK_DIR:-/cdrom}
 RESOLV_CONF=$SYSROOT/etc/resolv.conf
 RESOLVED_RESOLV=$SYSROOT/run/systemd/resolve/resolv.conf
 SYS_NET=$SYSROOT/sys/class/net
@@ -779,6 +898,10 @@ fail()
 	exit 0
 }
 
+[ -r "$HOOK_DIR/debian-live-server-timeout.sh" ] || fail "Shared timeout helper is missing from $HOOK_DIR."
+. "$HOOK_DIR/debian-live-server-timeout.sh"
+verify_busybox_timeout || exit 127
+
 cleanup()
 {
 	_rc=$?
@@ -792,14 +915,12 @@ cleanup()
 	exit "$_rc"
 }
 
-# field KEY LINE: print the word that follows KEY in LINE.
 field()
 {
 	printf '%s\n' "$2" | awk -v key="$1" '
 		{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }'
 }
 
-# is_ipv4 ADDRESS: succeed for a dotted-quad IPv4 address without leading zeros.
 is_ipv4()
 {
 	printf '%s\n' "$1" | awk -F. '
@@ -809,19 +930,6 @@ is_ipv4()
 				if ($i !~ /^[0-9]+$/ || length($i) > 3 || $i + 0 > 255 ||
 					(length($i) > 1 && substr($i, 1, 1) == "0")) exit 1
 		}'
-}
-
-# set_kv FILE KEY VALUE: replace an existing KEY= line or append one.
-# Writes through the existing file so its mode is preserved.
-set_kv()
-{
-	if grep -q "^$2=" "$1"; then
-		sed "s|^$2=.*|$2=$3|" "$1" > "$1.tmp"
-		cat "$1.tmp" > "$1"
-		rm -f "$1.tmp"
-	else
-		printf '%s=%s\n' "$2" "$3" >> "$1"
-	fi
 }
 
 [ -d "$TARGET_ROOT/etc" ] || fail "The installed target is not mounted at $TARGET_ROOT."
@@ -834,7 +942,6 @@ command -v awk >/dev/null 2>&1 || fail "The installer environment has no awk com
 [ -r "$RESOLV_CONF" ] || fail "The installer resolver configuration is unavailable."
 [ -d "$SYS_NET" ] || fail "The kernel network interface directory $SYS_NET is unavailable."
 
-# Directory modes are set explicitly: the umask above applies to files only.
 mkdir -p -m 755 "$TARGET_ROOT/etc/netplan"
 WORK=/tmp/debian-live-server-net.$$
 mkdir -m 700 "$WORK"
@@ -843,8 +950,6 @@ trap cleanup 0
 ip -br link || :
 ip -4 route show || :
 
-# The preferred route is the one the kernel uses for Internet-bound traffic. It
-# identifies the primary interface and the gateway the installed system must keep.
 route=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n '1p') || route=
 [ -n "$route" ] || fail "No usable IPv4 route exists after installer DHCP configuration."
 
@@ -862,7 +967,6 @@ is_ipv4 "$p_src" || fail "Invalid discovered IPv4 source address: $p_src"
 is_ipv4 "$p_gw" || fail "Invalid discovered IPv4 gateway: $p_gw"
 printf 'Preferred route: %s\n' "$route"
 
-# Discovery writes tab-separated facts; the renderer decides what to configure.
 FACTS=$WORK/facts
 : > "$FACTS"
 
@@ -946,20 +1050,7 @@ dns_list=$(awk '$1 == "nameserver" && NF >= 2 { print $2 }' "$DNS_SOURCE" |
 printf '%s\n' "$dns_list" | awk '{ printf "D\t%s\n", $0 }' >> "$FACTS"
 printf 'DNS source: %s\nDNS servers:\n%s\n' "$DNS_SOURCE" "$dns_list"
 
-# The renderer applies the decisions and writes the YAML to stdout. It also writes
-# warnings and the list of configured links to stderr, which is this log.
 cat > "$WORK/render.awk" <<'AWK'
-# render.awk - derive the static Netplan configuration from discovered link facts.
-#
-# Inputs:  -v wpa=PATH   installer wpa_supplicant.conf, or /dev/null
-#          facts file    tab-separated records:
-#                          L name kind up mac parent vlanid
-#                          A name cidr
-#                          R name to via metric     (to = "default" or a prefix)
-#                          P name gateway source    (the preferred route)
-#                          D dns-server
-# Output:  Netplan YAML on stdout. Diagnostics go to stderr, which the installer
-#          logs. Wi-Fi passphrases are written only to the YAML output.
 
 BEGIN {
 	FS = "\t"
@@ -995,7 +1086,6 @@ function is_ipv4(s,   o, n, i) {
 function cidr_addr(c,   t) { t = c; sub(/\/.*$/, "", t); return t }
 function cidr_pfx(c,   t)  { t = c; sub(/^[^\/]*\//, "", t); return t }
 
-# on_link(addr, prefix, gw): gw is a usable host address inside addr's subnet.
 function on_link(a, p, gw,   av, g, size, net, last) {
 	av = ipnum(a); g = ipnum(gw)
 	size = 2 ^ (32 - p)
@@ -1003,13 +1093,10 @@ function on_link(a, p, gw,   av, g, size, net, last) {
 	last = net + size - 1
 	if (g < net || g > last) return 0
 	if (g == av) return 0
-	# Neither the gateway nor the host's own address may be the network or broadcast
-	# address of a subnet that has more than two addresses.
 	if (p <= 30 && (g == net || g == last || av == net || av == last)) return 0
 	return 1
 }
 
-# gw_on_link(iface, gw): gw lies in the subnet of one of the iface's addresses.
 function gw_on_link(n, gw,   k) {
 	for (k = 1; k <= vcnt[n]; k++)
 		if (on_link(vaddr[n, k], vpfx[n, k], gw)) return 1
@@ -1024,10 +1111,7 @@ function valid_mac(m,   parts, n, i) {
 	return 1
 }
 
-# yq(s): single-quote a YAML scalar, doubling embedded single quotes.
 function yq(s,   t) { t = s; gsub(/'/, "''", t); return "'" t "'" }
-
-# ---- Wi-Fi credentials from the installer's wpa_supplicant.conf -------------
 
 function kv_value(line,   v) {
 	v = line
@@ -1095,8 +1179,6 @@ function parse_wpa(path,   line, innet, ssid, psk, km) {
 	close(path)
 }
 
-# ---- Collect the discovered facts -------------------------------------------
-
 $1 == "L" {
 	if (!($2 in lkind)) order[++nif] = $2
 	lkind[$2] = $3; lup[$2] = $4; lmac[$2] = $5; lpar[$2] = $6; lvid[$2] = $7
@@ -1106,14 +1188,11 @@ $1 == "R" { rc[$2]++; rto[$2, rc[$2]] = $3; rvia[$2, rc[$2]] = $4; rmet[$2, rc[$
 $1 == "P" { pname = $2; pgw = $3; psrc = $4 }
 $1 == "D" { dns[++nd] = $2 }
 
-# ---- Decide what is configured, then emit ------------------------------------
-
 END {
 	if (failed) exit 1
 	if (pname == "" || !(pname in lkind))
 		fatal("The preferred IPv4 route's interface was not discovered.")
 
-	# Usable addresses per interface.
 	for (i = 1; i <= nif; i++) {
 		n = order[i]; vcnt[n] = 0
 		for (k = 1; k <= ac[n]; k++) {
@@ -1126,7 +1205,6 @@ END {
 		}
 	}
 
-	# Which interfaces are configured.
 	for (i = 1; i <= nif; i++) {
 		n = order[i]; kind = lkind[n]
 		if (kind != "eth" && kind != "wifi" && kind != "vlan") {
@@ -1157,8 +1235,6 @@ END {
 		}
 		inc[n] = 1
 	}
-	# A VLAN parent without an usable address is still declared, so the VLAN
-	# has a valid link. It carries no addresses or routes.
 	for (n in needparent) {
 		if (!inc[n] && lkind[n] == "eth") { inc[n] = 1; parentonly[n] = 1 }
 	}
@@ -1171,7 +1247,6 @@ END {
 	for (k = 1; k <= vcnt[pname]; k++) if (vaddr[pname, k] == psrc) found = 1
 	if (!found) fatal("The preferred route's source address " psrc " is not a configured address on " pname ".")
 
-	# Default routes: the preferred route first, then the others.
 	primary_added = 0
 	for (pass = 1; pass <= 2; pass++) {
 		for (i = 1; i <= nif; i++) {
@@ -1203,8 +1278,6 @@ END {
 	}
 	if (!primary_added) fatal("The preferred default route was not present on " pname ".")
 
-	# Two default routes with the same metric would be ambiguous. Later routes are
-	# moved to the next free metric, so the preferred route keeps its metric.
 	for (d = 1; d <= ndef; d++) {
 		m = dmet[d]
 		while (m in usedm) m += 100
@@ -1212,7 +1285,6 @@ END {
 		dmet[d] = m
 	}
 
-	# Non-default routes (for example DHCP classless routes), when on-link.
 	for (i = 1; i <= nif; i++) {
 		n = order[i]
 		if (!inc[n] || parentonly[n]) continue
@@ -1239,7 +1311,6 @@ END {
 		}
 	}
 
-	# DNS servers: global, applied to interfaces that carry a default route.
 	ndns = 0
 	for (j = 1; j <= nd; j++) {
 		s = dns[j]
@@ -1249,7 +1320,6 @@ END {
 	}
 	if (ndns == 0) fatal("No usable IPv4 DNS server was discovered for the static configuration.")
 
-	# Diagnostics (no secrets).
 	for (i = 1; i <= nif; i++) {
 		n = order[i]
 		if (!inc[n]) continue
@@ -1263,18 +1333,16 @@ END {
 	}
 	if (nn > 0) info("Wi-Fi credentials transferred for " nn " network(s); passphrases are not logged.")
 
-	# Warn about every DHCP-derived address.
 	for (i = 1; i <= nif; i++) {
 		n = order[i]
 		if (!inc[n] || parentonly[n]) continue
 		mac = (lkind[n] == "vlan") ? lmac[lpar[n]] : lmac[n]
 		for (k = 1; k <= vcnt[n]; k++) {
 			where = (lkind[n] == "vlan") ? "VLAN " n " (ID " lvid[n] ", parent " lpar[n] ", MAC " mac ")" : "interface " n " (MAC " mac ")"
-			warn("DHCP-derived address " vaddr[n, k] "/" vpfx[n, k] " on " where " is now static in /etc/netplan/50-cloud-init.yaml. Reserve " vaddr[n, k] " for MAC " mac " in the DHCP server or IPAM before relying on it; otherwise another host can receive the same address. This script cannot create DHCP reservations.")
+			warn("DHCP-derived address " vaddr[n, k] "/" vpfx[n, k] " on " where " is now static in /etc/netplan/10-installer.yaml. Reserve " vaddr[n, k] " for MAC " mac " in the DHCP server or IPAM before relying on it; otherwise another host can receive the same address. This script cannot create DHCP reservations.")
 		}
 	}
 
-	# ---- YAML ----
 	neth = 0; nwifi = 0; nvlan = 0
 	for (i = 1; i <= nif; i++) {
 		n = order[i]
@@ -1284,8 +1352,6 @@ END {
 		else neth++
 	}
 
-	print "# Generated by debian-live-server-target-network.sh from the installer's network state."
-	print "# Addresses were DHCP-derived during installation. Reserve them externally (DHCP/IPAM)."
 	print "network:"
 	print "  version: 2"
 	print "  renderer: networkd"
@@ -1313,7 +1379,6 @@ END {
 	exit 0
 }
 
-# emit_device(n): an ethernets or wifis entry, matched by MAC and named as before.
 function emit_device(n) {
 	print "    " n ":"
 	if (valid_mac(lmac[n])) {
@@ -1328,7 +1393,6 @@ function emit_device(n) {
 	emit_addresses_and_routes(n)
 }
 
-# emit_vlan(n): a vlans entry. VLAN devices take their MAC from the parent.
 function emit_vlan(n) {
 	print "    " n ":"
 	print "      id: " lvid[n] + 0
@@ -1367,8 +1431,6 @@ function emit_addresses_and_routes(n,   k, d, x, nr) {
 	}
 }
 
-# emit_access_points(): Wi-Fi networks from the installer's configuration. The
-# passphrase is written only here, into the mode-600 Netplan file.
 function emit_access_points(   k) {
 	if (nn == 0) return
 	print "      access-points:"
@@ -1403,7 +1465,7 @@ cat "$WORK/netplan.yaml" > "$TMP_NETPLAN"
 chmod 600 "$TMP_NETPLAN"
 mv -f "$TMP_NETPLAN" "$NETPLAN_FILE"
 
-if ! in-target netplan generate; then
+if ! in_target 120 netplan generate; then
 	fail "Netplan rejected $NETPLAN_FILE in the installed system."
 fi
 
@@ -1411,17 +1473,13 @@ NETPLAN_BACKUP_READY=0
 printf 'Installed static Netplan configuration: %s\n' "$NETPLAN_FILE"
 NETWORK_HOOK
 
-# Target-only OpenSSH hook. It never modifies the live root.
 put 755 config/includes.binary/debian-live-server-target-ssh.sh <<'SSH_HOOK'
 #!/bin/sh
-#
-# debian-live-server-target-ssh.sh
-# Apply the requested OpenSSH settings to the installed target only.
-#
 set -eu
 umask 077
 
 TARGET_ROOT=${TARGET_ROOT:-/target}
+HOOK_DIR=${HOOK_DIR:-/cdrom}
 SSH_DIR=$TARGET_ROOT/etc/ssh
 DROPIN_DIR=$SSH_DIR/sshd_config.d
 DROPIN=$DROPIN_DIR/50-Debian.conf
@@ -1433,6 +1491,9 @@ fail()
 	exit 1
 }
 
+[ -r "$HOOK_DIR/debian-live-server-timeout.sh" ] || fail "Shared timeout helper is missing from $HOOK_DIR."
+. "$HOOK_DIR/debian-live-server-timeout.sh"
+
 cleanup()
 {
 	if [ -n "$TMP" ]; then
@@ -1443,6 +1504,8 @@ trap cleanup 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+verify_busybox_timeout || exit 127
 
 [ -d "$TARGET_ROOT/etc" ] ||
 	fail "The installed target is not mounted at $TARGET_ROOT."
@@ -1462,9 +1525,95 @@ mkdir -p "$DROPIN_DIR"
 [ ! -L "$DROPIN" ] ||
 	fail "Refusing to replace a symbolic-link SSH configuration file: $DROPIN."
 
+_KEYGEN_UNIT=$TARGET_ROOT/usr/lib/systemd/system/sshd-keygen.service
+[ -f "$_KEYGEN_UNIT" ] || [ -f "$TARGET_ROOT/lib/systemd/system/sshd-keygen.service" ] ||
+	fail "The Debian Trixie sshd-keygen.service unit is missing from the installed target."
+_KEYGEN_SCRIPT=$TARGET_ROOT/usr/local/sbin/debian-live-ssh-hostkeys
+[ ! -L "$TARGET_ROOT/usr/local/sbin" ] ||
+	fail "Refusing to write through a symbolic-link /usr/local/sbin in the target."
+mkdir -p "$TARGET_ROOT/usr/local/sbin"
+[ ! -L "$_KEYGEN_SCRIPT" ] ||
+	fail "Refusing to replace a symbolic-link target SSH host-key generator."
+cat > "$_KEYGEN_SCRIPT" <<'SSH_KEYGEN'
+#!/bin/sh
+set -eu
+umask 077
+
+SSH_DIR=/etc/ssh
+COMMENT=debian-live-target-host-key
+
+[ -d "$SSH_DIR" ] && [ ! -L "$SSH_DIR" ] || {
+	printf '%s\n' "SSH host-key directory is missing or unsafe." >&2
+	exit 1
+}
+
+ensure_key()
+{
+	_type=$1
+	_bits=$2
+	_file=$3
+	[ ! -L "$_file" ] && [ ! -L "$_file.pub" ] || {
+		printf 'Refusing symbolic-link SSH host-key path for %s.\n' "$_type" >&2
+		exit 1
+	}
+	if [ ! -s "$_file" ] || [ ! -s "$_file.pub" ]; then
+		rm -f "$_file" "$_file.pub"
+		if [ "$_type" = ed25519 ]; then
+			if ! ssh-keygen -q -t ed25519 -N '' -C "$COMMENT" -f "$_file" </dev/null >/dev/null 2>&1; then
+				printf 'SSH host-key generation failed for %s.\n' "$_type" >&2
+				exit 1
+			fi
+		else
+			if ! ssh-keygen -q -t "$_type" -b "$_bits" -N '' -C "$COMMENT" -f "$_file" </dev/null >/dev/null 2>&1; then
+				printf 'SSH host-key generation failed for %s.\n' "$_type" >&2
+				exit 1
+			fi
+		fi
+	fi
+	[ -s "$_file" ] && [ -s "$_file.pub" ] || {
+		printf 'SSH host-key files are incomplete for %s.\n' "$_type" >&2
+		exit 1
+	}
+	chmod 600 "$_file"
+	chmod 644 "$_file.pub"
+}
+
+ensure_key ed25519 0 "$SSH_DIR/ssh_host_ed25519_key"
+ensure_key ecdsa 521 "$SSH_DIR/ssh_host_ecdsa_key"
+ensure_key rsa 3072 "$SSH_DIR/ssh_host_rsa_key"
+SSH_KEYGEN
+chmod 755 "$_KEYGEN_SCRIPT" ||
+	fail "Cannot install the target first-boot SSH host-key generator."
+
+_KEYGEN_DROPIN_DIR=$TARGET_ROOT/etc/systemd/system/sshd-keygen.service.d
+[ ! -L "$TARGET_ROOT/etc/systemd/system" ] ||
+	fail "Refusing to write through a symbolic-link systemd unit directory."
+mkdir -p "$_KEYGEN_DROPIN_DIR"
+[ ! -L "$_KEYGEN_DROPIN_DIR" ] ||
+	fail "Refusing to write through a symbolic-link sshd-keygen drop-in directory."
+_KEYGEN_DROPIN=$_KEYGEN_DROPIN_DIR/10-debian-live.conf
+[ ! -L "$_KEYGEN_DROPIN" ] ||
+	fail "Refusing to replace a symbolic-link sshd-keygen drop-in."
+cat > "$_KEYGEN_DROPIN" <<'SSH_KEYGEN_UNIT'
+[Unit]
+ConditionFirstBoot=
+
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/debian-live-ssh-hostkeys
+SSH_KEYGEN_UNIT
+chmod 644 "$_KEYGEN_DROPIN" ||
+	fail "Cannot install the target sshd-keygen.service override."
+
+for _key in "$SSH_DIR"/ssh_host_*; do
+	[ -e "$_key" ] || [ -L "$_key" ] || continue
+	rm -f "$_key" || fail "Cannot remove an installer-time SSH host-key file."
+done
+in_target 60 /usr/local/sbin/debian-live-ssh-hostkeys ||
+	fail "Cannot create temporary target host keys for SSH configuration validation."
+
 TMP=$(mktemp "$DROPIN_DIR/.50-Debian.conf.XXXXXX") ||
 	fail "Cannot create a temporary SSH configuration file."
-
 cat > "$TMP" <<'SSHD_CONFIG'
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -1473,40 +1622,51 @@ chmod 644 "$TMP"
 mv -f "$TMP" "$DROPIN"
 TMP=
 
-# Validate the installed daemon configuration and confirm that these settings
-# are effective after all included drop-ins have been read.
 mkdir -p "$TARGET_ROOT/run/sshd"
 chmod 755 "$TARGET_ROOT/run/sshd"
-in-target /usr/sbin/sshd -t ||
+in_target 60 /usr/sbin/sshd -t ||
 	fail "The installed OpenSSH configuration failed validation."
-EFFECTIVE_CONFIG=$(in-target /usr/sbin/sshd -T 2>/dev/null) ||
+EFFECTIVE_CONFIG=$(in_target 60 /usr/sbin/sshd -T 2>/dev/null) ||
 	fail "Cannot read the effective installed OpenSSH configuration."
 printf '%s\n' "$EFFECTIVE_CONFIG" | grep -Fxq 'permitrootlogin yes' ||
 	fail "PermitRootLogin yes is not effective in the installed SSH configuration."
 printf '%s\n' "$EFFECTIVE_CONFIG" | grep -Fxq 'passwordauthentication yes' ||
 	fail "PasswordAuthentication yes is not effective in the installed SSH configuration."
-in-target systemctl enable ssh.service ||
+
+for _key in "$SSH_DIR"/ssh_host_*; do
+	[ -e "$_key" ] || [ -L "$_key" ] || continue
+	rm -f "$_key" || fail "Cannot remove temporary SSH host keys before reboot."
+done
+for _key in "$SSH_DIR"/ssh_host_*; do
+	[ ! -e "$_key" ] && [ ! -L "$_key" ] ||
+		fail "An installer-time SSH host key remains in the target."
+done
+
+in_target 60 systemctl --root=/ enable sshd-keygen.service ||
+	fail "Could not enable first-boot SSH host-key generation."
+in_target 60 systemctl --root=/ enable ssh.service ||
 	fail "Could not enable ssh.service in the installed target."
 
-printf 'Wrote, validated and enabled %s\n' "$DROPIN"
+printf 'Wrote and validated %s; host keys will be generated on first boot with no build-hostname comment.\n' "$DROPIN"
 SSH_HOOK
 
 put 755 config/includes.binary/debian-live-server-target-grub.sh <<'GRUB_HOOK'
 #!/bin/sh
-#
-# debian-live-server-target-grub.sh
-# Apply and regenerate the installed system's GRUB timeout configuration.
-#
 set -eu
 umask 077
 
 TARGET_ROOT=${TARGET_ROOT:-/target}
+HOOK_DIR=${HOOK_DIR:-/cdrom}
 
 fail()
 {
 	printf 'GRUB CONFIGURATION ERROR: %s\n' "$*" >&2
 	exit 1
 }
+
+[ -r "$HOOK_DIR/debian-live-server-timeout.sh" ] || fail "Shared timeout helper is missing from $HOOK_DIR."
+. "$HOOK_DIR/debian-live-server-timeout.sh"
+verify_busybox_timeout || exit 127
 
 [ -d "$TARGET_ROOT/etc" ] || fail "The installed target is not mounted at $TARGET_ROOT."
 GRUB_FILE=$TARGET_ROOT/etc/default/grub
@@ -1533,6 +1693,7 @@ set_kv()
 set_kv "$GRUB_FILE" GRUB_TIMEOUT 0
 set_kv "$GRUB_FILE" GRUB_TIMEOUT_STYLE hidden
 set_kv "$GRUB_FILE" GRUB_RECORDFAIL_TIMEOUT 0
+set_kv "$GRUB_FILE" GRUB_DISABLE_OS_PROBER true
 
 grep -Fxq 'GRUB_TIMEOUT=0' "$GRUB_FILE" ||
 	fail "GRUB_TIMEOUT=0 was not persisted."
@@ -1540,9 +1701,11 @@ grep -Fxq 'GRUB_TIMEOUT_STYLE=hidden' "$GRUB_FILE" ||
 	fail "GRUB_TIMEOUT_STYLE=hidden was not persisted."
 grep -Fxq 'GRUB_RECORDFAIL_TIMEOUT=0' "$GRUB_FILE" ||
 	fail "GRUB_RECORDFAIL_TIMEOUT=0 was not persisted."
+grep -Fxq 'GRUB_DISABLE_OS_PROBER=true' "$GRUB_FILE" ||
+	fail "GRUB_DISABLE_OS_PROBER=true was not persisted."
 
-in-target update-grub ||
-	fail "update-grub failed in the installed target."
+in_target 600 update-grub ||
+	fail "update-grub failed or did not finish within its time limit."
 
 GRUB_CFG=$TARGET_ROOT/boot/grub/grub.cfg
 [ -s "$GRUB_CFG" ] ||
@@ -1553,22 +1716,25 @@ grep -Eq '^[[:space:]]*set timeout_style=hidden[[:space:]]*$' "$GRUB_CFG" ||
 	fail "Generated grub.cfg does not contain the required hidden timeout style."
 
 printf 'Installed GRUB configuration:\n'
-grep -E '^(GRUB_TIMEOUT|GRUB_TIMEOUT_STYLE|GRUB_RECORDFAIL_TIMEOUT)=' "$GRUB_FILE"
+grep -E '^(GRUB_TIMEOUT|GRUB_TIMEOUT_STYLE|GRUB_RECORDFAIL_TIMEOUT|GRUB_DISABLE_OS_PROBER)=' "$GRUB_FILE"
 printf 'Regenerated %s.\n' "$TARGET_ROOT/boot/grub/grub.cfg"
 GRUB_HOOK
 
 put 755 config/includes.binary/debian-live-server-target-postinstall.sh <<'POSTINSTALL_HOOK'
 #!/bin/sh
-#
-# debian-live-server-target-postinstall.sh
-# Run each target post-install hook independently and retain a combined log.
-#
 set -u
 umask 077
 
 TARGET_ROOT=${TARGET_ROOT:-/target}
 HOOK_DIR=${HOOK_DIR:-/cdrom}
+HOOK_LIMIT_SECONDS=${HOOK_LIMIT_SECONDS:-900}
 LOG=$TARGET_ROOT/var/log/debian-live-server-postinstall.log
+
+[ -r "$HOOK_DIR/debian-live-server-timeout.sh" ] || {
+	printf 'POST-INSTALL ERROR: shared timeout helper is missing: %s\n' "$HOOK_DIR/debian-live-server-timeout.sh" >&2
+	exit 127
+}
+. "$HOOK_DIR/debian-live-server-timeout.sh"
 
 [ -d "$TARGET_ROOT/etc" ] || {
 	printf 'POST-INSTALL ERROR: target is not mounted at %s.\n' "$TARGET_ROOT" >&2
@@ -1579,6 +1745,9 @@ exec 3>&1
 exec >> "$LOG" 2>&1
 
 failed=0
+
+verify_busybox_timeout || exit 127
+
 run_hook()
 {
 	_name=$1
@@ -1589,11 +1758,11 @@ run_hook()
 		failed=1
 		return
 	fi
-	if /bin/sh "$_path"; then
+	if bounded "$HOOK_LIMIT_SECONDS" /bin/sh "$_path"; then
 		printf 'RESULT: %s completed successfully.\n' "$_name"
 	else
 		_rc=$?
-		printf 'ERROR: %s failed with exit code %s.\n' "$_name" "$_rc"
+		printf 'ERROR: %s failed or timed out (exit code %s).\n' "$_name" "$_rc"
 		failed=1
 	fi
 }
@@ -1622,7 +1791,6 @@ printf '\nAll target post-installation hooks completed successfully.\n'
 printf 'Target post-installation completed. Log: %s\n' "$LOG" >&3
 POSTINSTALL_HOOK
 
-# Preseed: static answers first, then optional sections driven by the variables above.
 PRESEED_FILE=config/includes.binary/preseed.cfg
 put 600 "$PRESEED_FILE" <<PRESEED
 d-i auto-install/enable boolean true
@@ -1633,7 +1801,7 @@ d-i keyboard-configuration/xkb-keymap select $KEYMAP
 d-i console-setup/ask_detect boolean false
 d-i clock-setup/utc boolean true
 d-i time/zone string $TIMEZONE
-d-i clock-setup/ntp boolean true
+d-i clock-setup/ntp boolean false
 
 d-i netcfg/enable boolean true
 d-i netcfg/disable_autoconfig boolean false
@@ -1651,22 +1819,16 @@ d-i mirror/http/directory string /debian
 d-i mirror/http/proxy string
 d-i mirror/suite string $CODENAME
 
-# Enable the root account and do not create a regular user.
-# Leave the root password unset here so the graphical installer asks for it
-# (and its confirmation) interactively.
 d-i passwd/root-login boolean true
 d-i passwd/make-user boolean false
 
-tasksel tasksel/first multiselect standard, ssh-server
-# Target packages. netplan.io renders the static configuration, wpasupplicant is the
-# Wi-Fi backend for systemd-networkd, and the two systemd units are enabled by the
-# late_command. openssh-server is configured by the separate target-only SSH hook.
-d-i pkgsel/include string cloud-init fastfetch netplan.io wpasupplicant systemd-resolved systemd-timesyncd openssh-server
+tasksel tasksel/first multiselect standard
+d-i pkgsel/include string fastfetch netplan.io wpasupplicant systemd-resolved systemd-timesyncd openssh-server
 d-i pkgsel/upgrade select none
 popularity-contest popularity-contest/participate boolean false
 
 d-i grub-installer/only_debian boolean true
-d-i grub-installer/with_other_os boolean true
+d-i grub-installer/with_other_os boolean false
 d-i preseed/late_command string /bin/sh /cdrom/debian-live-server-target-postinstall.sh
 d-i finish-install/reboot_in_progress note
 PRESEED
@@ -1696,11 +1858,41 @@ PARTMAN
 	} >> "$PRESEED_FILE"
 fi
 
-# Boot menus. Both are generated from the same variables, so the default entry, timeout
-# and kernel parameters agree. The installer is the default; the live session is separate.
-ISOLINUX_TIMEOUT=$((BOOT_TIMEOUT_SECONDS * 10))
+LIVE_PACKAGE_LIST=config/package-lists/custom-standard.list.chroot
+grep -Fxq cloud-init "$LIVE_PACKAGE_LIST" ||
+	fail "cloud-init must remain in the live package list."
+grep -Fxq sos "$LIVE_PACKAGE_LIST" ||
+	fail "sos must remain available for operator-invoked live diagnostics."
+if grep -Fxq openssh-server "$LIVE_PACKAGE_LIST"; then
+	fail "openssh-server must not be installed in the live root."
+fi
+for _unused_package in bcache-tools multipath-tools open-iscsi overlayroot; do
+	if grep -Fxq "$_unused_package" "$LIVE_PACKAGE_LIST"; then
+		fail "Unconfigured storage/overlay package is still in the live package list: $_unused_package."
+	fi
+done
+grep -Fq openssh-server "$PRESEED_FILE" ||
+	fail "openssh-server must be installed into the target through preseed."
+SSH_HOOK_FILE=config/includes.binary/debian-live-server-target-ssh.sh
+grep -Fq 'COMMENT=debian-live-target-host-key' "$SSH_HOOK_FILE" ||
+	fail "The target SSH host-key generator must use a fixed, non-hostname key comment."
+grep -Fq 'ExecStart=/usr/local/sbin/debian-live-ssh-hostkeys' "$SSH_HOOK_FILE" ||
+	fail "The target first-boot SSH key-generation service override is missing."
+grep -Fq 'ConditionFirstBoot=' "$SSH_HOOK_FILE" ||
+	fail "The target SSH key-generation service must not depend on installer first-boot state."
+[ -x config/hooks/normal/0150-scrub-live-ssh-host-keys.hook.chroot ] ||
+	fail "The live SSH host-key scrub hook is missing or not executable."
+[ -x config/hooks/normal/0300-standard-directory-modes.hook.chroot ] ||
+	fail "The pre-SquashFS directory-mode hook is missing or not executable."
+[ -s config/includes.chroot/etc/netplan/50-cloud-init.yaml ] ||
+	fail "The live Netplan file /etc/netplan/50-cloud-init.yaml is missing."
+case $BOOTAPPEND_LIVE in
+	*cloud-init=disabled*) ;;
+	*) fail "cloud-init must remain disabled during the live boot to preserve the curated Netplan file." ;;
+esac
+
+ISOLINUX_TIMEOUT=$((LIVE_BOOT_TIMEOUT_SECONDS * 10))
 put 644 config/bootloaders/isolinux/isolinux.cfg <<ISOLINUX
-# BIOS boot menu (ISOLINUX). Generated by build-debian-live.sh.
 UI vesamenu.c32
 DEFAULT installer-gtk
 PROMPT 0
@@ -1719,10 +1911,7 @@ LABEL live
 	APPEND initrd=/live/initrd.img $BOOTAPPEND_LIVE
 ISOLINUX
 
-# live-build generates /boot/grub/grub.cfg for both GRUB BIOS and UEFI from
-# config/bootloaders/grub-pc; grub-efi is not the source for this menu.
 put 644 config/bootloaders/grub-pc/grub.cfg <<GRUBCFG
-# UEFI boot menu (GRUB). Generated by build-debian-live.sh.
 if search --no-floppy --set=root --file /live/vmlinuz; then
 	set iso_root_found=1
 else
@@ -1730,7 +1919,7 @@ else
 fi
 
 set default="installer-gtk"
-set timeout=$BOOT_TIMEOUT_SECONDS
+set timeout=$LIVE_BOOT_TIMEOUT_SECONDS
 
 menuentry "Install Debian (graphical installer)" --id installer-gtk {
 	linux /install/gtk/vmlinuz $BOOTAPPEND_INSTALL --- quiet
@@ -1743,16 +1932,57 @@ menuentry "Try Debian Live without installing" --id live {
 }
 GRUBCFG
 
-# ---- Build -------------------------------------------------------------------
+grep -Fq 'set_kv "$GRUB_FILE" GRUB_TIMEOUT 0' config/includes.binary/debian-live-server-target-grub.sh ||
+	fail "The target GRUB hook no longer enforces GRUB_TIMEOUT=0."
+grep -Fq "set timeout=$LIVE_BOOT_TIMEOUT_SECONDS" config/bootloaders/grub-pc/grub.cfg ||
+	fail "The live UEFI boot menu is not tied to the 30-second live timeout."
+[ "$LIVE_BOOT_TIMEOUT_SECONDS" -eq 30 ] ||
+	fail "The graphical installer live boot timeout must be exactly 30 seconds."
 
 lb config --dump > "$WORKSPACE_DIR/lb-config.dump" 2>&1
 say "Building Debian Live Standard and its graphical installer."
-# Keep restrictive file creation for logs and secrets, but use standard system
-# permissions for the generated Debian filesystem and package triggers.
-(
-	umask 022
-	run lb build
-)
+run lb build
+
+[ ! -x "$WORKSPACE_DIR/chroot/usr/sbin/sshd" ] ||
+	fail "The live chroot unexpectedly contains sshd; the ISO must not ship a live SSH server."
+for _live_key in "$WORKSPACE_DIR/chroot/etc/ssh"/ssh_host_*; do
+	[ ! -e "$_live_key" ] && [ ! -L "$_live_key" ] ||
+		fail "An SSH host key remains in the live chroot and would be exposed in the ISO: ${_live_key##*/}."
+done
+
+SQUASHFS_IMAGE=$WORKSPACE_DIR/binary/live/filesystem.squashfs
+[ -s "$SQUASHFS_IMAGE" ] ||
+	fail "The live-build SquashFS image is missing: $SQUASHFS_IMAGE."
+LC_ALL=C unsquashfs -s "$SQUASHFS_IMAGE" > "$WORKSPACE_DIR/squashfs-info.txt" 2>&1 ||
+	fail "Cannot inspect the generated SquashFS superblock."
+grep -Eiq 'Compression[[:space:]:]+zstd([[:space:]]|$)' "$WORKSPACE_DIR/squashfs-info.txt" ||
+	fail "The generated live filesystem is not Zstandard-compressed; see $WORKSPACE_DIR/squashfs-info.txt."
+
+verify_build_directory_modes()
+{
+	for _dir in \
+		"$WORKSPACE_DIR" \
+		"$WORKSPACE_DIR/chroot" \
+		"$WORKSPACE_DIR/chroot/etc" \
+		"$WORKSPACE_DIR/chroot/usr" \
+		"$WORKSPACE_DIR/chroot/usr/bin" \
+		"$WORKSPACE_DIR/chroot/usr/sbin" \
+		"$WORKSPACE_DIR/chroot/usr/lib" \
+		"$WORKSPACE_DIR/chroot/usr/lib/x86_64-linux-gnu" \
+		"$WORKSPACE_DIR/chroot/usr/lib/systemd" \
+		"$WORKSPACE_DIR/chroot/usr/lib/systemd/system" \
+		"$WORKSPACE_DIR/chroot/usr/share" \
+		"$WORKSPACE_DIR/chroot/var" \
+		"$WORKSPACE_DIR/chroot/var/log"; do
+		[ -d "$_dir" ] || fail "Expected build directory is missing: $_dir."
+		[ ! -L "$_dir" ] || fail "Refusing to change a symbolic-link build directory: $_dir."
+		chmod 755 "$_dir" || fail "Cannot set standard directory mode 755 on $_dir."
+		[ "$(stat -c '%a' "$_dir")" = 755 ] ||
+			fail "Build directory does not have mode 755: $_dir."
+	done
+	say "Verified workspace/chroot, /etc, /usr/bin, /usr/sbin, /usr/lib, /usr/share and /var/log directory modes are 755."
+}
+verify_build_directory_modes
 
 set --
 for _candidate in "$WORKSPACE_DIR"/*.iso; do
@@ -1761,8 +1991,6 @@ for _candidate in "$WORKSPACE_DIR"/*.iso; do
 	fi
 done
 [ "$#" -eq 1 ] || fail "Expected exactly one ISO from live-build; found $#."
-# Verify the workspace ISO first. A rejected image must not be published to the
-# final output path, otherwise the next invocation refuses to overwrite it.
 BUILT_ISO=$1
 FINAL_OUTPUT_ISO=$OUTPUT_ISO
 OUTPUT_ISO=$BUILT_ISO
@@ -1770,14 +1998,10 @@ OUTPUT_ISO=$BUILT_ISO
 ISO_BYTES=$(wc -c < "$OUTPUT_ISO" | tr -d ' ')
 [ "$ISO_BYTES" -ge "$MIN_ISO_BYTES" ] || fail "Output ISO is unexpectedly smaller than 100 MiB."
 
-# ---- ISO verification --------------------------------------------------------
-
 iso_report eltorito-report.txt -report_el_torito plain
 grep -qi 'El Torito' "$WORKSPACE_DIR/eltorito-report.txt" ||
 	fail "No El Torito boot catalog was reported."
 
-# Classify each El Torito image by platform ID: BIOS is 0x00, UEFI is 0xEF. An image that
-# cannot be identified is a failure.
 EL_CLASSES=$WORKSPACE_DIR/eltorito-platforms.txt
 awk '
 	/El Torito boot img/ {
@@ -1810,14 +2034,31 @@ grep -q 'vmlinuz' "$WORKSPACE_DIR/installer-gtk-files.txt" ||
 grep -q 'initrd.gz' "$WORKSPACE_DIR/installer-gtk-files.txt" ||
 	fail "GTK installer initrd is missing from /install/gtk."
 
-iso_report system-area-report.txt -report_system_area plain
+INSTALLER_INITRD=$WORKSPACE_DIR/installer-gtk-initrd.gz
+INSTALLER_INITRD_DIR=$WORKSPACE_DIR/installer-gtk-initrd
+iso_extract /install/gtk/initrd.gz "$INSTALLER_INITRD"
+gzip -t "$INSTALLER_INITRD" ||
+	fail "The graphical installer initrd is not a valid gzip stream."
+mkdir -m 700 "$INSTALLER_INITRD_DIR"
+gzip -dc "$INSTALLER_INITRD" |
+	(cd "$INSTALLER_INITRD_DIR" && cpio -idm --quiet --no-absolute-filenames) ||
+	fail "Cannot unpack the graphical installer initrd to verify BusyBox."
+[ -x "$INSTALLER_INITRD_DIR/bin/busybox" ] ||
+	fail "The graphical installer initrd does not contain /bin/busybox."
+if ! chroot "$INSTALLER_INITRD_DIR" /bin/busybox timeout 1 /bin/busybox true \
+	>/dev/null 2>&1; then
+	fail "The graphical installer BusyBox lacks a working timeout applet. Use a Trixie busybox-udeb with CONFIG_TIMEOUT enabled; no unbounded post-install fallback is permitted."
+fi
+say "Verified: the generated graphical installer initrd's BusyBox timeout applet executes successfully."
 
-# Exact-copy checks: the files the installer and boot menus rely on must be byte-identical
-# to their sources in this build.
+iso_report system-area-report.txt -report_system_area plain
+iso_report pvd-info.txt -pvd_info
+grep -F 'Volume Id' "$WORKSPACE_DIR/pvd-info.txt" | grep -Fq "$ISO_VOLUME" ||
+	fail "The generated ISO volume ID does not match the validated label $ISO_VOLUME."
+
 ISO_VERIFY_DIR=$WORKSPACE_DIR/iso-verify
 mkdir -m 700 "$ISO_VERIFY_DIR"
 
-# verify_iso_copy ISO_PATH SOURCE LABEL: the ISO copy must match SOURCE exactly.
 verify_iso_copy()
 {
 	_vc_tmp=$ISO_VERIFY_DIR/$(basename "$1").check
@@ -1834,18 +2075,14 @@ verify_iso_copy /debian-live-server-target-network.sh config/includes.binary/deb
 verify_iso_copy /debian-live-server-target-ssh.sh config/includes.binary/debian-live-server-target-ssh.sh "The target SSH hook"
 verify_iso_copy /debian-live-server-target-grub.sh config/includes.binary/debian-live-server-target-grub.sh "The target GRUB hook"
 verify_iso_copy /debian-live-server-target-postinstall.sh config/includes.binary/debian-live-server-target-postinstall.sh "The target post-install orchestrator"
+verify_iso_copy /debian-live-server-timeout.sh config/includes.binary/debian-live-server-timeout.sh "The shared timeout helper"
 verify_iso_copy /sysctl.conf config/includes.binary/sysctl.conf "The sysctl configuration"
-# Reject an unrelated GRUB menu even if its boot catalog is UEFI-capable.
 verify_iso_copy /boot/grub/grub.cfg config/bootloaders/grub-pc/grub.cfg "The GRUB boot menu"
 
-# The BIOS menu loads the vesamenu module from the ISO, so the module must be present.
 iso_extract /isolinux/vesamenu.c32 "$ISO_VERIFY_DIR/vesamenu.c32"
 iso_extract /isolinux/isolinux.cfg "$ISO_VERIFY_DIR/isolinux.cfg"
 iso_extract /boot/grub/grub.cfg "$ISO_VERIFY_DIR/grub.cfg"
 
-# Menu checks, shared by both menus. Both must boot the installer by default after the
-# timeout. The live session must be a separate entry without installer parameters.
-# tag names the menu in messages; the menu-specific rules come before these checks.
 ENTRY_CHECKS='
 		if (index(body["installer-gtk"], "/install/gtk/vmlinuz") == 0 ||
 			index(body["installer-gtk"], inst) == 0) {
@@ -1860,7 +2097,6 @@ ENTRY_CHECKS='
 		exit bad
 	}'
 
-# ISOLINUX: keywords are case-insensitive; entries are collected by label.
 BIOS_RULES='
 	tolower($1) == "label" { cur = $2; next }
 	tolower($1) == "default" { def = $2; next }
@@ -1873,40 +2109,54 @@ BIOS_RULES='
 		if (def != "installer-gtk") { print "BIOS menu DEFAULT is \"" def "\"; expected installer-gtk."; bad = 1 }
 		if (tmo != want_tmo) { print "BIOS menu TIMEOUT is " tmo " (tenths of a second); expected " want_tmo "."; bad = 1 }'
 
-# GRUB: entries are menuentry blocks identified by --id.
 UEFI_RULES='
-	/^set default=/ { def = $0 }
-	/^set timeout=/ { tmo = $0 }
-	/^menuentry / {
+	/^[[:space:]]*set[[:space:]]+default[[:space:]]*=/ {
+		def = $0
+		sub(/^[[:space:]]*/, "", def)
+		sub(/^set[[:space:]]+default[[:space:]]*=[[:space:]]*/, "", def)
+		gsub(/"/, "", def)
+		gsub(/[[:space:]]/, "", def)
+	}
+	/^[[:space:]]*set[[:space:]]+timeout[[:space:]]*=/ {
+		tmo = $0
+		sub(/^[[:space:]]*/, "", tmo)
+		sub(/^set[[:space:]]+timeout[[:space:]]*=[[:space:]]*/, "", tmo)
+		gsub(/"/, "", tmo)
+		gsub(/[[:space:]]/, "", tmo)
+	}
+	/^[[:space:]]*menuentry[[:space:]]/ {
 		cur = $0; sub(/.*--id[ \t]+/, "", cur); sub(/[ \t].*$/, "", cur); next
 	}
-	/^}/ { cur = ""; next }
-	cur != "" && ($1 == "linux" || $1 == "initrd") { body[cur] = body[cur] " " $0 }
+	/^[[:space:]]*}[[:space:]]*$/ { cur = ""; next }
+	cur != "" && ($1 == "linux" || $1 == "linuxefi" || $1 == "linux16" ||
+		$1 == "initrd" || $1 == "initrdefi" || $1 == "initrd16") {
+		body[cur] = body[cur] " " $0
+	}
 	END {
 		bad = 0
-		if (def != "set default=\"installer-gtk\"") { print "UEFI menu default is: " def "; expected installer-gtk."; bad = 1 }
-		if (tmo != "set timeout=" want_tmo) { print "UEFI menu timeout is: " tmo "; expected " want_tmo "."; bad = 1 }'
+		if (def != "installer-gtk") { print "UEFI menu default is: " def "; expected installer-gtk."; bad = 1 }
+		if (tmo != want_tmo) { print "UEFI menu timeout is: " tmo "; expected " want_tmo "."; bad = 1 }'
 
 if ! awk -v tag=BIOS -v inst="$BOOTAPPEND_INSTALL" -v live="$BOOTAPPEND_LIVE" \
-		-v want_tmo="$((BOOT_TIMEOUT_SECONDS * 10))" "$BIOS_RULES$ENTRY_CHECKS" \
+		-v want_tmo="$((LIVE_BOOT_TIMEOUT_SECONDS * 10))" "$BIOS_RULES$ENTRY_CHECKS" \
 		"$ISO_VERIFY_DIR/isolinux.cfg"; then
 	fail "The BIOS boot menu on the ISO does not match the required installer-default configuration."
 fi
 
 if ! awk -v tag=UEFI -v inst="$BOOTAPPEND_INSTALL" -v live="$BOOTAPPEND_LIVE" \
-		-v want_tmo="$BOOT_TIMEOUT_SECONDS" "$UEFI_RULES$ENTRY_CHECKS" \
+		-v want_tmo="$LIVE_BOOT_TIMEOUT_SECONDS" "$UEFI_RULES$ENTRY_CHECKS" \
 		"$ISO_VERIFY_DIR/grub.cfg"; then
 	fail "The UEFI boot menu on the ISO does not match the required installer-default configuration."
 fi
 
-# ---- Artifacts ---------------------------------------------------------------
-
-# Publish only after all ISO checks pass; keep the final filename in provenance.
 mv "$OUTPUT_ISO" "$FINAL_OUTPUT_ISO"
 OUTPUT_ISO=$FINAL_OUTPUT_ISO
+chmod 644 "$OUTPUT_ISO"
+[ "$(stat -c '%a' "$OUTPUT_ISO")" = 644 ] || fail "The published ISO must have mode 644."
 ISO_SHA256=$(sha256_of "$OUTPUT_ISO")
 printf '%s  %s\n' "$ISO_SHA256" "$OUTPUT_ISO" > "$ISO_SHA_FILE"
-chmod 600 "$ISO_SHA_FILE"
+chmod 644 "$ISO_SHA_FILE"
+[ "$(stat -c '%a' "$ISO_SHA_FILE")" = 644 ] || fail "The SHA256 file must have mode 644."
 
 if [ -d "$WORKSPACE_DIR/chroot/var/lib/dpkg" ]; then
 	dpkg-query --admindir="$WORKSPACE_DIR/chroot/var/lib/dpkg" \
@@ -1919,13 +2169,16 @@ if [ -n "$TARGET_DISK" ]; then AUTO_PARTITIONING=enabled; else AUTO_PARTITIONING
 {
 	printf 'Artifact: %s\n' "$OUTPUT_ISO"
 	printf 'SHA256: %s\n' "$ISO_SHA256"
+	printf 'Artifact permissions: ISO 644, SHA256 file 644, provenance file 644\n'
 	printf 'Size bytes: %s\n' "$ISO_BYTES"
 	printf 'Build UTC: %s\n' "$(timestamp)"
 	printf 'Build host: %s\n' "$(uname -srm)"
+	printf 'Build umask: 022; workspace and essential live chroot directories are normalized to 755; secret-bearing temporary installer directories retain umask 077\n'
 	printf 'Host Debian version: %s\n' "$(cat /etc/debian_version)"
 	printf 'Architecture: amd64\n'
 	printf 'Requested suite: %s\n' "$DEBIAN_SUITE"
 	printf 'Resolved codename: %s\n' "$CODENAME"
+	printf 'ISO volume ID: %s (uppercase A-Z, digits and underscore; maximum 16 characters)\n' "$ISO_VOLUME"
 	printf 'live-build version: %s\n' "$LB_VERSION"
 	printf 'Debian repository: %s\n' "$DEBIAN_MIRROR"
 	printf 'Security repository: %s\n' "$SECURITY_MIRROR"
@@ -1933,13 +2186,22 @@ if [ -n "$TARGET_DISK" ]; then AUTO_PARTITIONING=enabled; else AUTO_PARTITIONING
 	printf 'Installed network: static systemd-networkd Netplan at /etc/netplan/10-installer.yaml when discovery succeeds; otherwise preserve DHCP configuration\n'
 	printf 'Automatic partitioning: %s\n' "$AUTO_PARTITIONING"
 	printf 'Installer account: root-only (root password entered interactively in the graphical installer)\n'
-	printf 'Installed SSH: target-only /etc/ssh/sshd_config.d/50-Debian.conf; root password authentication enabled\n'
-	printf 'Installed GRUB: GRUB_TIMEOUT=0, GRUB_TIMEOUT_STYLE=hidden, GRUB_RECORDFAIL_TIMEOUT=0; update-grub executed\n'
-	printf 'Target post-install: independent system, network, SSH and GRUB hooks; combined log /var/log/debian-live-server-postinstall.log\n'
+	printf 'Installed SSH: target-only; openssh-server is excluded from the live root and installed by preseed in the target\n'
+	printf 'SSH host keys: no host keys are shipped in the ISO; installer-time target keys are removed; sshd-keygen.service generates target keys at boot with fixed comment debian-live-target-host-key; private keys are never written to build or installer logs\n'
+	printf 'Installed GRUB: GRUB_TIMEOUT=0, GRUB_TIMEOUT_STYLE=hidden, GRUB_RECORDFAIL_TIMEOUT=0, GRUB_DISABLE_OS_PROBER=true; update-grub executed\n'
+	printf 'Installer os-prober: disabled (grub-installer/with_other_os=false)\n'
+	printf 'Target post-install: independent system, network, SSH and GRUB hooks, each time-limited; combined log /var/log/debian-live-server-postinstall.log\n'
 	printf 'Installer: Debian Installer GTK, live-installer mode\n'
-	printf 'Target packages: cloud-init is installed by pkgsel; its network configuration is disabled to preserve installer-generated Netplan\n'
-	printf 'Boot menus: BIOS (ISOLINUX) and UEFI (GRUB); the graphical installer is the default after %s seconds\n' "$BOOT_TIMEOUT_SECONDS"
-	printf 'Live session: root console autologin; cloud-init omitted from live root and disabled at live boot; network-online wait masked for live boot only\n'
+	printf 'Live packages: cloud-init is installed but disabled at live boot; live Netplan filename is /etc/netplan/50-cloud-init.yaml\n'
+	printf 'Target packages: cloud-init is not requested; installed system uses installer-owned static systemd-networkd Netplan\n'
+	printf 'Live package review: sos retained only for manual sosreport diagnostics (no automatic collection and not installed in target); bcache-tools, multipath-tools, open-iscsi and overlayroot omitted because no bcache, SAN multipath, iSCSI or overlayroot configuration is used\n'
+	printf 'Target boot: systemd-networkd-wait-online masked; NTP synchronised by systemd-timesyncd after first boot\n'
+	printf 'Live boot menus: BIOS (ISOLINUX) and UEFI (GRUB); graphical installer starts by default after exactly %s seconds\n' "$LIVE_BOOT_TIMEOUT_SECONDS"
+	printf 'Live session: passwordless root autologin is intentional for immediate local-console rescue and installation; it is confined to the ephemeral live session, with no live SSH daemon or host keys; the installed target has its own password-protected root account\n'
+	printf 'IPv6 policy: system-wide IPv6 is intentionally disabled on live and installed systems (all/default/lo) under the IPv4-only security policy, preventing unintended dual-stack exposure until IPv6 routing, firewall, DNS and monitoring are explicitly configured\n'
+	printf 'SquashFS: zstd compression level %s; extended attributes enabled; workspace POSIX ACL support and ACL round-trip are checked before build\n' "$SQUASHFS_COMPRESSION_LEVEL"
+	printf 'Installer BusyBox: timeout applet verified by executing the BusyBox binary extracted from the graphical installer initrd\n'
+	printf 'Live session: cloud-init package included but disabled at live boot; systemd-networkd-wait-online masked for live boot only\n'
 	printf 'Fastfetch: invoked from /etc/profile in both live and installed systems\n'
 	printf 'Installer kernel parameters: %s\n' "$BOOTAPPEND_INSTALL"
 	printf 'Preseed: /preseed.cfg on the ISO root, loaded by preseed/file=/cdrom/preseed.cfg\n'
@@ -1951,7 +2213,8 @@ if [ -n "$TARGET_DISK" ]; then AUTO_PARTITIONING=enabled; else AUTO_PARTITIONING
 	printf 'Debian repository signatures authenticate repository metadata, not this ISO.\n'
 	printf 'The DHCP-derived address must be reserved for the target MAC to avoid conflicts.\n'
 } > "$ISO_PROVENANCE"
-chmod 600 "$ISO_PROVENANCE"
+chmod 644 "$ISO_PROVENANCE"
+[ "$(stat -c '%a' "$ISO_PROVENANCE")" = 644 ] || fail "The provenance file must have mode 644."
 
 say "Build completed."
 say "ISO:        $OUTPUT_ISO"
