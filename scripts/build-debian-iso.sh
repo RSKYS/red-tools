@@ -23,7 +23,7 @@
 #  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # Environment:
-#   OUTPUT_ISO                  Output ISO path (default: ./debian-custom.iso)
+#   OUTPUT_ISO                  Output ISO path (default: ./debian-live-server.iso)
 #   LOG_FILE                    Build log path (default: ./debian-live-build.log)
 #   WORKSPACE_DIR               Build workspace; must not already exist
 #   DEBIAN_SUITE                Suite to build (default: stable)
@@ -41,7 +41,7 @@ set -eu
 umask 077
 
 CWD=$(pwd -P)
-OUTPUT_ISO=${OUTPUT_ISO:-$CWD/debian-custom.iso}
+OUTPUT_ISO=${OUTPUT_ISO:-$CWD/debian-live-server_red.iso}
 LOG_FILE=${LOG_FILE:-$CWD/debian-live-build.log}
 WORKSPACE_DIR=${WORKSPACE_DIR:-}
 DEBIAN_SUITE=${DEBIAN_SUITE:-stable}
@@ -346,7 +346,9 @@ cd "$WORKSPACE_DIR"
 
 # ---- live-build configuration -----------------------------------------------
 
-BOOTAPPEND_LIVE="boot=live components quiet"
+# Use root for the live console autologin. Disable cloud-init only for this live boot:
+# the live image does not need cloud metadata discovery, which can delay startup.
+BOOTAPPEND_LIVE="boot=live components username=root cloud-init=disabled systemd.mask=systemd-networkd-wait-online.service quiet"
 BOOTAPPEND_INSTALL="auto=true priority=critical preseed/file=/cdrom/preseed.cfg"
 ISO_VOLUME="CUSTOM-DEBIAN-${CODENAME}-AMD64"
 
@@ -379,7 +381,7 @@ run lb config \
 	--backports false \
 	--memtest none \
 	--checksums sha256 \
-	--image-name "debian-custom-live-standard-${CODENAME}-amd64" \
+	--image-name "debian-live-server-live-standard-${CODENAME}-amd64" \
 	--iso-application "Custom Debian Live Standard" \
 	--iso-preparer "Local live-build derivative" \
 	--iso-publisher "Custom Debian Live build" \
@@ -392,7 +394,6 @@ cat > config/package-lists/custom-standard.list.chroot <<'PACKAGES'
 bcache-tools
 byobu
 ca-certificates
-cloud-init
 cryptsetup
 curl
 dosfstools
@@ -429,6 +430,7 @@ wget
 zstd
 PACKAGES
 
+# cloud-init is installed on the target by pkgsel, not in the live root, to avoid its boot-time probes.
 # Static Netplan for the live system. The installed system gets its own from the installer hook.
 put 600 config/includes.chroot/etc/netplan/50-cloud-init.yaml <<'NETPLAN'
 network:
@@ -512,14 +514,209 @@ fi
 rm -f "$TMP_PROFILE"
 HOOK
 
-# Installer late_command: converts the discovered network state into a static Netplan
-# configuration, then applies the sysctl, resolver, service and GRUB settings.
-put 755 config/includes.binary/debian-custom-target-network.sh <<'NETWORK_HOOK'
+# Target network hook: convert discovered installer network state into static Netplan.
+# If discovery is incomplete, preserve the existing DHCP configuration instead.
+put 755 config/includes.binary/debian-live-server-target-system.sh <<'SYSTEM_HOOK'
 #!/bin/sh
 #
-# debian-custom-target-network.sh
+# debian-live-server-target-system.sh
+# Apply target-wide settings as independent steps; one optional setting must not
+# prevent the remaining post-install configuration from being attempted.
 #
-# Preseed late_command, run by the Debian Installer as /cdrom/debian-custom-target-network.sh.
+set -u
+umask 077
+
+TARGET_ROOT=${TARGET_ROOT:-/target}
+SYSCTL_SOURCE=${SYSCTL_SOURCE:-/cdrom/sysctl.conf}
+
+[ -d "$TARGET_ROOT/etc" ] || {
+	printf 'SYSTEM CONFIGURATION ERROR: target is not mounted at %s.\n' "$TARGET_ROOT" >&2
+	exit 1
+}
+mkdir -p "$TARGET_ROOT/var/log" || exit 1
+exec >> "$TARGET_ROOT/var/log/debian-live-server-system.log" 2>&1
+printf 'Starting target system configuration at %s.\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
+failed=0
+
+run_step()
+{
+	_step_name=$1
+	shift
+	printf '\n--- %s ---\n' "$_step_name"
+	if "$@"; then
+		printf 'RESULT: %s completed.\n' "$_step_name"
+	else
+		_step_rc=$?
+		printf 'ERROR: %s failed with exit code %s.\n' "$_step_name" "$_step_rc"
+		failed=1
+	fi
+}
+
+configure_cloud_init()
+{
+	# cloud-init is optional at runtime; if installed, stop it from replacing Netplan.
+	if [ ! -d "$TARGET_ROOT/etc/cloud" ]; then
+		printf 'cloud-init configuration directory is absent; no cloud-init network override is needed.\n'
+		return 0
+	fi
+	mkdir -p "$TARGET_ROOT/etc/cloud/cloud.cfg.d" || return 1
+	_cloud_tmp=$(mktemp "$TARGET_ROOT/etc/cloud/cloud.cfg.d/.99-disable-network-config.XXXXXX") || return 1
+	printf '%s\n' 'network: {config: disabled}' > "$_cloud_tmp" || {
+		rm -f "$_cloud_tmp"
+		return 1
+	}
+	chmod 644 "$_cloud_tmp" || {
+		rm -f "$_cloud_tmp"
+		return 1
+	}
+	mv -f "$_cloud_tmp" "$TARGET_ROOT/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg"
+}
+
+ensure_netplan()
+{
+	mkdir -p "$TARGET_ROOT/etc/netplan" || return 1
+	_have_netplan=0
+	for _yaml in "$TARGET_ROOT"/etc/netplan/*.yaml; do
+		[ -f "$_yaml" ] || continue
+		_have_netplan=1
+		break
+	done
+	if [ "$_have_netplan" -eq 0 ]; then
+		_fallback_tmp=$(mktemp "$TARGET_ROOT/etc/netplan/.10-installer-fallback.XXXXXX") || return 1
+		cat > "$_fallback_tmp" <<'NETPLAN'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    all-ethernet:
+      match:
+        name: "e*"
+      dhcp4: true
+      dhcp6: false
+NETPLAN
+		chmod 600 "$_fallback_tmp" || {
+			rm -f "$_fallback_tmp"
+			return 1
+		}
+		mv -f "$_fallback_tmp" "$TARGET_ROOT/etc/netplan/10-installer-fallback.yaml" || return 1
+		printf 'Created DHCP fallback Netplan configuration.\n'
+	fi
+}
+
+configure_fastfetch()
+{
+	[ -x "$TARGET_ROOT/usr/bin/fastfetch" ] || {
+		printf 'Fastfetch executable is missing from the installed target.\n'
+		return 1
+	}
+	_profile=$TARGET_ROOT/etc/profile
+	[ -f "$_profile" ] || {
+		printf 'Installed target profile is missing: %s\n' "$_profile"
+		return 1
+	}
+	_profile_tmp=$(mktemp "${_profile}.XXXXXX") || return 1
+	if ! awk '
+		$0 != "fastfetch" { lines[++count] = $0 }
+		END {
+			while (count > 0 && lines[count] == "") count--
+			for (i = 1; i <= count; i++) print lines[i]
+			print ""
+			print "fastfetch"
+		}
+	' "$_profile" > "$_profile_tmp"; then
+		rm -f "$_profile_tmp"
+		return 1
+	fi
+	if ! cat "$_profile_tmp" > "$_profile"; then
+		rm -f "$_profile_tmp"
+		return 1
+	fi
+	rm -f "$_profile_tmp"
+	printf 'Enabled Fastfetch in %s.\n' "$_profile"
+}
+
+install_sysctl()
+{
+	[ -r "$SYSCTL_SOURCE" ] || {
+		printf 'Missing sysctl source: %s\n' "$SYSCTL_SOURCE"
+		return 1
+	}
+	_sysctl_target=$TARGET_ROOT/etc/sysctl.conf
+	[ ! -L "$_sysctl_target" ] || {
+		printf 'Refusing to write through a symbolic-link sysctl configuration.\n'
+		return 1
+	}
+	_sysctl_tmp=$(mktemp "$TARGET_ROOT/etc/.sysctl.conf.XXXXXX") || return 1
+	if ! cp "$SYSCTL_SOURCE" "$_sysctl_tmp" || ! chmod 644 "$_sysctl_tmp"; then
+		rm -f "$_sysctl_tmp"
+		return 1
+	fi
+	mv -f "$_sysctl_tmp" "$_sysctl_target" || {
+		rm -f "$_sysctl_tmp"
+		return 1
+	}
+	printf 'Installed sysctl configuration at %s.\n' "$_sysctl_target"
+}
+
+configure_resolver()
+{
+	_resolv_target=$TARGET_ROOT/etc/resolv.conf
+	[ ! -d "$_resolv_target" ] || {
+		printf 'Target /etc/resolv.conf is unexpectedly a directory.\n'
+		return 1
+	}
+	rm -f "$_resolv_target" || return 1
+	ln -s /run/systemd/resolve/stub-resolv.conf "$_resolv_target" || return 1
+	printf 'Configured /etc/resolv.conf for systemd-resolved.\n'
+}
+
+enable_network_services()
+{
+	command -v in-target >/dev/null 2>&1 || {
+		printf 'Debian Installer in-target command is unavailable.\n'
+		return 1
+	}
+	_service_failed=0
+	for _unit in systemd-networkd systemd-resolved systemd-timesyncd; do
+		if ! in-target systemctl enable "$_unit.service"; then
+			printf 'Could not enable %s.service.\n' "$_unit"
+			_service_failed=1
+		fi
+	done
+	for _unit in NetworkManager networking; do
+		if [ -e "$TARGET_ROOT/usr/lib/systemd/system/$_unit.service" ] ||
+		   [ -e "$TARGET_ROOT/lib/systemd/system/$_unit.service" ]; then
+			if ! in-target systemctl mask "$_unit.service"; then
+				printf 'Could not mask conflicting %s.service.\n' "$_unit"
+				_service_failed=1
+			fi
+		fi
+	done
+	return "$_service_failed"
+}
+
+run_step "Cloud-init network ownership" configure_cloud_init
+run_step "Netplan fallback" ensure_netplan
+run_step "Fastfetch login profile" configure_fastfetch
+run_step "Sysctl configuration" install_sysctl
+run_step "Resolver configuration" configure_resolver
+run_step "Network service configuration" enable_network_services
+
+if [ "$failed" -ne 0 ]; then
+	printf '\nTarget system configuration completed with errors; see this log and the combined post-install log.\n'
+	exit 1
+fi
+
+printf '\nTarget system configuration completed successfully.\n'
+SYSTEM_HOOK
+
+put 755 config/includes.binary/debian-live-server-target-network.sh <<'NETWORK_HOOK'
+#!/bin/sh
+#
+# debian-live-server-target-network.sh
+#
+# Preseed late_command, run by the Debian Installer as /cdrom/debian-live-server-target-network.sh.
 # Discovers every link that holds a global IPv4 address, classifies each as Ethernet,
 # Wi-Fi, VLAN, or unsupported, and writes one authoritative Netplan file for the
 # installed system: $TARGET_ROOT/etc/netplan/50-cloud-init.yaml (mode 600).
@@ -543,8 +740,12 @@ RESOLV_CONF=$SYSROOT/etc/resolv.conf
 RESOLVED_RESOLV=$SYSROOT/run/systemd/resolve/resolv.conf
 SYS_NET=$SYSROOT/sys/class/net
 SYS_VIRT=$SYSROOT/sys/devices/virtual/net
-SYSCTL_SOURCE=/cdrom/sysctl.conf
-NETPLAN_FILE=$TARGET_ROOT/etc/netplan/50-cloud-init.yaml
+NETPLAN_FILE=$TARGET_ROOT/etc/netplan/10-installer.yaml
+NETWORK_LOG=$TARGET_ROOT/var/log/debian-live-server-network-discovery.log
+WORK=
+NETPLAN_BACKUP=
+NETPLAN_BACKUP_READY=0
+TMP_NETPLAN=
 
 WPA_CONF=
 for _wpa in "$SYSROOT/etc/wpa_supplicant/wpa_supplicant.conf" "$SYSROOT/etc/wpa_supplicant.conf"; do
@@ -554,10 +755,41 @@ for _wpa in "$SYSROOT/etc/wpa_supplicant/wpa_supplicant.conf" "$SYSROOT/etc/wpa_
 	fi
 done
 
+restore_netplan()
+{
+	[ "$NETPLAN_BACKUP_READY" = 1 ] || return 0
+	for _old in "$TARGET_ROOT"/etc/netplan/*.yaml; do
+		[ -e "$_old" ] || continue
+		rm -f "$_old" || return 1
+	done
+	if [ -d "$NETPLAN_BACKUP" ]; then
+		cp -a "$NETPLAN_BACKUP/." "$TARGET_ROOT/etc/netplan/" || return 1
+	fi
+	NETPLAN_BACKUP_READY=0
+}
+
 fail()
 {
-	printf 'NETWORK CONFIGURATION ERROR: %s\n' "$*" >&2
-	exit 1
+	_message=$*
+	if [ "$NETPLAN_BACKUP_READY" = 1 ] && ! restore_netplan; then
+		printf 'NETWORK CONFIGURATION ERROR: %s; failed to restore the previous Netplan files.\n' "$_message" >&2
+		exit 1
+	fi
+	printf 'WARNING: Static network migration was skipped: %s. Existing Netplan configuration was preserved.\n' "$_message" >&2
+	exit 0
+}
+
+cleanup()
+{
+	_rc=$?
+	trap - 0
+	if [ "$NETPLAN_BACKUP_READY" = 1 ] && ! restore_netplan; then
+		printf 'NETWORK CONFIGURATION ERROR: failed to restore the previous Netplan configuration.\n' >&2
+		_rc=1
+	fi
+	[ -z "$TMP_NETPLAN" ] || rm -f "$TMP_NETPLAN"
+	[ -z "$WORK" ] || rm -rf "$WORK"
+	exit "$_rc"
 }
 
 # field KEY LINE: print the word that follows KEY in LINE.
@@ -593,20 +825,20 @@ set_kv()
 }
 
 [ -d "$TARGET_ROOT/etc" ] || fail "The installed target is not mounted at $TARGET_ROOT."
+mkdir -p "$TARGET_ROOT/var/log"
+exec > "$NETWORK_LOG" 2>&1
+printf 'Starting target network discovery at %s.\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
 command -v ip >/dev/null 2>&1 || fail "The installer environment has no ip command."
 command -v awk >/dev/null 2>&1 || fail "The installer environment has no awk command."
 [ -r "$RESOLV_CONF" ] || fail "The installer resolver configuration is unavailable."
-[ -r "$SYSCTL_SOURCE" ] || fail "Missing $SYSCTL_SOURCE on the installation medium."
 [ -d "$SYS_NET" ] || fail "The kernel network interface directory $SYS_NET is unavailable."
 
-mkdir -p "$TARGET_ROOT/var/log"
 # Directory modes are set explicitly: the umask above applies to files only.
 mkdir -p -m 755 "$TARGET_ROOT/etc/netplan"
-exec > "$TARGET_ROOT/var/log/debian-custom-network-discovery.log" 2>&1
-
-WORK=/tmp/debian-custom-net.$$
+WORK=/tmp/debian-live-server-net.$$
 mkdir -m 700 "$WORK"
-trap 'rm -rf "$WORK"' 0
+trap cleanup 0
 
 ip -br link || :
 ip -4 route show || :
@@ -675,7 +907,7 @@ for _link in "$SYS_NET"/*; do
 	fi
 
 	state=$(cat "$SYS_NET/$name/operstate" 2>/dev/null || printf unknown)
-	if [ "$state" = up ]; then up=up; else up=down; fi
+	if [ "$state" = up ] || [ "$state" = unknown ]; then up=up; else up=down; fi
 	mac=$(cat "$SYS_NET/$name/address" 2>/dev/null || printf '')
 	printf 'L\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$kind" "$up" "$mac" "$parent" "$vid" >> "$FACTS"
 
@@ -1052,7 +1284,7 @@ END {
 		else neth++
 	}
 
-	print "# Generated by debian-custom-target-network.sh from the installer's network state."
+	print "# Generated by debian-live-server-target-network.sh from the installer's network state."
 	print "# Addresses were DHCP-derived during installation. Reserve them externally (DHCP/IPAM)."
 	print "network:"
 	print "  version: 2"
@@ -1149,75 +1381,41 @@ function emit_access_points(   k) {
 AWK
 
 if ! awk -v wpa="${WPA_CONF:-/dev/null}" -f "$WORK/render.awk" "$FACTS" > "$WORK/netplan.yaml"; then
-	fail "No safe static Netplan configuration could be derived. See $TARGET_ROOT/var/log/debian-custom-network-discovery.log."
+	fail "No safe static Netplan configuration could be derived. See $TARGET_ROOT/var/log/debian-live-server-network-discovery.log."
 fi
 [ -s "$WORK/netplan.yaml" ] || fail "The generated Netplan configuration is empty."
 
-rm -f "$TARGET_ROOT"/etc/netplan/*.yaml
-cat "$WORK/netplan.yaml" > "$NETPLAN_FILE"
-chmod 600 "$NETPLAN_FILE"
-printf 'Wrote %s\n' "$NETPLAN_FILE"
-
-in-target netplan generate || fail "Netplan rejected $NETPLAN_FILE in the installed system."
-
-# Ensure Fastfetch is installed in the target and invoked at login. The preseed
-# explicitly requests the package; this check prevents writing a broken profile
-# entry if package installation did not provide the executable.
-[ -x "$TARGET_ROOT/usr/bin/fastfetch" ] ||
-	fail "Fastfetch is missing from the installed target; refusing to add a broken /etc/profile entry."
-
-TARGET_PROFILE=$TARGET_ROOT/etc/profile
-[ -f "$TARGET_PROFILE" ] || fail "The installed target profile is missing: $TARGET_PROFILE."
-TMP_TARGET_PROFILE=$(mktemp "${TARGET_PROFILE}.XXXXXX") ||
-	fail "Cannot create a temporary file for $TARGET_PROFILE."
-if ! awk '
-	$0 != "fastfetch" { lines[++count] = $0 }
-	END {
-		while (count > 0 && lines[count] == "") count--
-		for (i = 1; i <= count; i++) print lines[i]
-		print ""
-		print "fastfetch"
-	}
-' "$TARGET_PROFILE" > "$TMP_TARGET_PROFILE"; then
-	rm -f "$TMP_TARGET_PROFILE"
-	fail "Cannot prepare the updated installed target profile: $TARGET_PROFILE."
-fi
-# Write through the existing file to preserve its ownership and permissions.
-if ! cat "$TMP_TARGET_PROFILE" > "$TARGET_PROFILE"; then
-	rm -f "$TMP_TARGET_PROFILE"
-	fail "Cannot update the installed target profile: $TARGET_PROFILE."
-fi
-rm -f "$TMP_TARGET_PROFILE"
-printf 'Enabled Fastfetch at login in the installed system: %s\n' "$TARGET_PROFILE"
-
-SYSCTL_TARGET=$TARGET_ROOT/etc/sysctl.conf
-[ ! -L "$SYSCTL_TARGET" ] || fail "Refusing to write through a symbolic-link sysctl configuration: $SYSCTL_TARGET."
-cp "$SYSCTL_SOURCE" "$SYSCTL_TARGET"
-chmod 644 "$SYSCTL_TARGET"
-printf 'Installed sysctl configuration: %s\n' "$SYSCTL_TARGET"
-
-rm -f "$TARGET_ROOT/etc/resolv.conf"
-ln -s /run/systemd/resolve/stub-resolv.conf "$TARGET_ROOT/etc/resolv.conf"
-
-for unit in systemd-networkd systemd-resolved systemd-timesyncd; do
-	in-target systemctl enable "$unit.service"
+NETPLAN_BACKUP=$WORK/original-netplan
+mkdir -m 700 "$NETPLAN_BACKUP"
+for _old in "$TARGET_ROOT"/etc/netplan/*.yaml; do
+	[ -e "$_old" ] || continue
+	cp -a "$_old" "$NETPLAN_BACKUP/" || fail "Cannot back up existing Netplan file $_old."
 done
-for unit in NetworkManager networking; do
-	in-target systemctl mask "$unit.service"
-done
+NETPLAN_BACKUP_READY=1
 
-GRUB_FILE=$TARGET_ROOT/etc/default/grub
-[ -f "$GRUB_FILE" ] || fail "Target /etc/default/grub is missing."
-set_kv "$GRUB_FILE" GRUB_TIMEOUT 0
-set_kv "$GRUB_FILE" GRUB_TIMEOUT_STYLE hidden
-in-target update-grub
+for _old in "$TARGET_ROOT"/etc/netplan/*.yaml; do
+	[ -e "$_old" ] || continue
+	rm -f "$_old" || fail "Cannot replace existing Netplan file $_old."
+done
+TMP_NETPLAN=$(mktemp "$TARGET_ROOT/etc/netplan/.10-installer.yaml.XXXXXX") ||
+	fail "Cannot create a temporary Netplan file in the installed target."
+cat "$WORK/netplan.yaml" > "$TMP_NETPLAN"
+chmod 600 "$TMP_NETPLAN"
+mv -f "$TMP_NETPLAN" "$NETPLAN_FILE"
+
+if ! in-target netplan generate; then
+	fail "Netplan rejected $NETPLAN_FILE in the installed system."
+fi
+
+NETPLAN_BACKUP_READY=0
+printf 'Installed static Netplan configuration: %s\n' "$NETPLAN_FILE"
 NETWORK_HOOK
 
-# Installer late_command for the target's OpenSSH. It never modifies the live root.
-put 755 config/includes.binary/debian-custom-target-ssh.sh <<'SSH_HOOK'
+# Target-only OpenSSH hook. It never modifies the live root.
+put 755 config/includes.binary/debian-live-server-target-ssh.sh <<'SSH_HOOK'
 #!/bin/sh
 #
-# debian-custom-target-ssh.sh
+# debian-live-server-target-ssh.sh
 # Apply the requested OpenSSH settings to the installed target only.
 #
 set -eu
@@ -1241,7 +1439,10 @@ cleanup()
 		rm -f "$TMP"
 	fi
 }
-trap cleanup 0 HUP INT TERM
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 [ -d "$TARGET_ROOT/etc" ] ||
 	fail "The installed target is not mounted at $TARGET_ROOT."
@@ -1284,9 +1485,142 @@ printf '%s\n' "$EFFECTIVE_CONFIG" | grep -Fxq 'permitrootlogin yes' ||
 	fail "PermitRootLogin yes is not effective in the installed SSH configuration."
 printf '%s\n' "$EFFECTIVE_CONFIG" | grep -Fxq 'passwordauthentication yes' ||
 	fail "PasswordAuthentication yes is not effective in the installed SSH configuration."
+in-target systemctl enable ssh.service ||
+	fail "Could not enable ssh.service in the installed target."
 
-printf 'Wrote and validated %s\n' "$DROPIN"
+printf 'Wrote, validated and enabled %s\n' "$DROPIN"
 SSH_HOOK
+
+put 755 config/includes.binary/debian-live-server-target-grub.sh <<'GRUB_HOOK'
+#!/bin/sh
+#
+# debian-live-server-target-grub.sh
+# Apply and regenerate the installed system's GRUB timeout configuration.
+#
+set -eu
+umask 077
+
+TARGET_ROOT=${TARGET_ROOT:-/target}
+
+fail()
+{
+	printf 'GRUB CONFIGURATION ERROR: %s\n' "$*" >&2
+	exit 1
+}
+
+[ -d "$TARGET_ROOT/etc" ] || fail "The installed target is not mounted at $TARGET_ROOT."
+GRUB_FILE=$TARGET_ROOT/etc/default/grub
+[ -f "$GRUB_FILE" ] && [ ! -L "$GRUB_FILE" ] ||
+	fail "The installed target's /etc/default/grub is missing or unsafe."
+command -v in-target >/dev/null 2>&1 ||
+	fail "The Debian Installer in-target command is unavailable."
+
+set_kv()
+{
+	_file=$1
+	_key=$2
+	_value=$3
+	_tmp=${_file}.tmp.$$
+	if grep -q "^${_key}=" "$_file"; then
+		sed "s|^${_key}=.*|${_key}=${_value}|" "$_file" > "$_tmp"
+		cat "$_tmp" > "$_file"
+		rm -f "$_tmp"
+	else
+		printf '%s=%s\n' "$_key" "$_value" >> "$_file"
+	fi
+}
+
+set_kv "$GRUB_FILE" GRUB_TIMEOUT 0
+set_kv "$GRUB_FILE" GRUB_TIMEOUT_STYLE hidden
+set_kv "$GRUB_FILE" GRUB_RECORDFAIL_TIMEOUT 0
+
+grep -Fxq 'GRUB_TIMEOUT=0' "$GRUB_FILE" ||
+	fail "GRUB_TIMEOUT=0 was not persisted."
+grep -Fxq 'GRUB_TIMEOUT_STYLE=hidden' "$GRUB_FILE" ||
+	fail "GRUB_TIMEOUT_STYLE=hidden was not persisted."
+grep -Fxq 'GRUB_RECORDFAIL_TIMEOUT=0' "$GRUB_FILE" ||
+	fail "GRUB_RECORDFAIL_TIMEOUT=0 was not persisted."
+
+in-target update-grub ||
+	fail "update-grub failed in the installed target."
+
+GRUB_CFG=$TARGET_ROOT/boot/grub/grub.cfg
+[ -s "$GRUB_CFG" ] ||
+	fail "update-grub did not produce /boot/grub/grub.cfg."
+grep -Eq '^[[:space:]]*set timeout=0[[:space:]]*$' "$GRUB_CFG" ||
+	fail "Generated grub.cfg does not contain the required zero-second timeout."
+grep -Eq '^[[:space:]]*set timeout_style=hidden[[:space:]]*$' "$GRUB_CFG" ||
+	fail "Generated grub.cfg does not contain the required hidden timeout style."
+
+printf 'Installed GRUB configuration:\n'
+grep -E '^(GRUB_TIMEOUT|GRUB_TIMEOUT_STYLE|GRUB_RECORDFAIL_TIMEOUT)=' "$GRUB_FILE"
+printf 'Regenerated %s.\n' "$TARGET_ROOT/boot/grub/grub.cfg"
+GRUB_HOOK
+
+put 755 config/includes.binary/debian-live-server-target-postinstall.sh <<'POSTINSTALL_HOOK'
+#!/bin/sh
+#
+# debian-live-server-target-postinstall.sh
+# Run each target post-install hook independently and retain a combined log.
+#
+set -u
+umask 077
+
+TARGET_ROOT=${TARGET_ROOT:-/target}
+HOOK_DIR=${HOOK_DIR:-/cdrom}
+LOG=$TARGET_ROOT/var/log/debian-live-server-postinstall.log
+
+[ -d "$TARGET_ROOT/etc" ] || {
+	printf 'POST-INSTALL ERROR: target is not mounted at %s.\n' "$TARGET_ROOT" >&2
+	exit 1
+}
+mkdir -p "$TARGET_ROOT/var/log"
+exec 3>&1
+exec >> "$LOG" 2>&1
+
+failed=0
+run_hook()
+{
+	_name=$1
+	_path=$2
+	printf '\n===== %s =====\n' "$_name"
+	if [ ! -r "$_path" ]; then
+		printf 'ERROR: required hook is missing: %s\n' "$_path"
+		failed=1
+		return
+	fi
+	if /bin/sh "$_path"; then
+		printf 'RESULT: %s completed successfully.\n' "$_name"
+	else
+		_rc=$?
+		printf 'ERROR: %s failed with exit code %s.\n' "$_name" "$_rc"
+		failed=1
+	fi
+}
+
+printf 'Target post-installation started: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+run_hook "System configuration" "$HOOK_DIR/debian-live-server-target-system.sh"
+if [ -f "$TARGET_ROOT/var/log/debian-live-server-system.log" ]; then
+	printf '\n===== Target system configuration detail =====\n'
+	cat "$TARGET_ROOT/var/log/debian-live-server-system.log"
+fi
+run_hook "Network configuration" "$HOOK_DIR/debian-live-server-target-network.sh"
+if [ -f "$TARGET_ROOT/var/log/debian-live-server-network-discovery.log" ]; then
+	printf '\n===== Network discovery detail =====\n'
+	cat "$TARGET_ROOT/var/log/debian-live-server-network-discovery.log"
+fi
+run_hook "OpenSSH configuration" "$HOOK_DIR/debian-live-server-target-ssh.sh"
+run_hook "GRUB configuration" "$HOOK_DIR/debian-live-server-target-grub.sh"
+
+if [ "$failed" -ne 0 ]; then
+	printf '\nPOST-INSTALL FAILED. Review %s for individual hook output.\n' "$LOG"
+	printf 'Target post-installation failed. See %s\n' "$LOG" >&3
+	exit 1
+fi
+
+printf '\nAll target post-installation hooks completed successfully.\n'
+printf 'Target post-installation completed. Log: %s\n' "$LOG" >&3
+POSTINSTALL_HOOK
 
 # Preseed: static answers first, then optional sections driven by the variables above.
 PRESEED_FILE=config/includes.binary/preseed.cfg
@@ -1327,13 +1661,13 @@ tasksel tasksel/first multiselect standard, ssh-server
 # Target packages. netplan.io renders the static configuration, wpasupplicant is the
 # Wi-Fi backend for systemd-networkd, and the two systemd units are enabled by the
 # late_command. openssh-server is configured by the separate target-only SSH hook.
-d-i pkgsel/include string fastfetch netplan.io wpasupplicant systemd-resolved systemd-timesyncd openssh-server
+d-i pkgsel/include string cloud-init fastfetch netplan.io wpasupplicant systemd-resolved systemd-timesyncd openssh-server
 d-i pkgsel/upgrade select none
 popularity-contest popularity-contest/participate boolean false
 
 d-i grub-installer/only_debian boolean true
 d-i grub-installer/with_other_os boolean true
-d-i preseed/late_command string /bin/sh /cdrom/debian-custom-target-network.sh && /bin/sh /cdrom/debian-custom-target-ssh.sh
+d-i preseed/late_command string /bin/sh /cdrom/debian-live-server-target-postinstall.sh
 d-i finish-install/reboot_in_progress note
 PRESEED
 
@@ -1495,8 +1829,11 @@ verify_iso_copy()
 }
 
 verify_iso_copy /preseed.cfg config/includes.binary/preseed.cfg "The preseed file"
-verify_iso_copy /debian-custom-target-network.sh config/includes.binary/debian-custom-target-network.sh "The installer late_command"
-verify_iso_copy /debian-custom-target-ssh.sh config/includes.binary/debian-custom-target-ssh.sh "The installer SSH hook"
+verify_iso_copy /debian-live-server-target-system.sh config/includes.binary/debian-live-server-target-system.sh "The target system hook"
+verify_iso_copy /debian-live-server-target-network.sh config/includes.binary/debian-live-server-target-network.sh "The target network hook"
+verify_iso_copy /debian-live-server-target-ssh.sh config/includes.binary/debian-live-server-target-ssh.sh "The target SSH hook"
+verify_iso_copy /debian-live-server-target-grub.sh config/includes.binary/debian-live-server-target-grub.sh "The target GRUB hook"
+verify_iso_copy /debian-live-server-target-postinstall.sh config/includes.binary/debian-live-server-target-postinstall.sh "The target post-install orchestrator"
 verify_iso_copy /sysctl.conf config/includes.binary/sysctl.conf "The sysctl configuration"
 # Reject an unrelated GRUB menu even if its boot catalog is UEFI-capable.
 verify_iso_copy /boot/grub/grub.cfg config/bootloaders/grub-pc/grub.cfg "The GRUB boot menu"
@@ -1593,13 +1930,16 @@ if [ -n "$TARGET_DISK" ]; then AUTO_PARTITIONING=enabled; else AUTO_PARTITIONING
 	printf 'Debian repository: %s\n' "$DEBIAN_MIRROR"
 	printf 'Security repository: %s\n' "$SECURITY_MIRROR"
 	printf 'Installer network: netcfg (DHCP on the interface chosen by the installer); no build-host network values embedded\n'
-	printf 'Installed network: static systemd-networkd Netplan at /etc/netplan/50-cloud-init.yaml, generated from the interfaces the installer discovered\n'
+	printf 'Installed network: static systemd-networkd Netplan at /etc/netplan/10-installer.yaml when discovery succeeds; otherwise preserve DHCP configuration\n'
 	printf 'Automatic partitioning: %s\n' "$AUTO_PARTITIONING"
 	printf 'Installer account: root-only (root password entered interactively in the graphical installer)\n'
 	printf 'Installed SSH: target-only /etc/ssh/sshd_config.d/50-Debian.conf; root password authentication enabled\n'
+	printf 'Installed GRUB: GRUB_TIMEOUT=0, GRUB_TIMEOUT_STYLE=hidden, GRUB_RECORDFAIL_TIMEOUT=0; update-grub executed\n'
+	printf 'Target post-install: independent system, network, SSH and GRUB hooks; combined log /var/log/debian-live-server-postinstall.log\n'
 	printf 'Installer: Debian Installer GTK, live-installer mode\n'
+	printf 'Target packages: cloud-init is installed by pkgsel; its network configuration is disabled to preserve installer-generated Netplan\n'
 	printf 'Boot menus: BIOS (ISOLINUX) and UEFI (GRUB); the graphical installer is the default after %s seconds\n' "$BOOT_TIMEOUT_SECONDS"
-	printf 'Live session: separate boot entry, for trying the system without installing\n'
+	printf 'Live session: root console autologin; cloud-init omitted from live root and disabled at live boot; network-online wait masked for live boot only\n'
 	printf 'Fastfetch: invoked from /etc/profile in both live and installed systems\n'
 	printf 'Installer kernel parameters: %s\n' "$BOOTAPPEND_INSTALL"
 	printf 'Preseed: /preseed.cfg on the ISO root, loaded by preseed/file=/cdrom/preseed.cfg\n'
