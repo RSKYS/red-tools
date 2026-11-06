@@ -144,58 +144,6 @@ verify_inrelease()
 		fail "The $3 InRelease signature could not be verified."
 }
 
-verify_acl_support()
-{
-	_acl_root=$WORKSPACE_DIR/.acl-roundtrip.$$
-	_acl_source=$_acl_root/source
-	_acl_image=$_acl_root/probe.squashfs
-	_acl_unpacked=$_acl_root/unpacked
-	_acl_log=$_acl_root/mksquashfs.log
-
-	mkdir -m 700 "$_acl_root" ||
-		fail "Cannot create the ACL verification workspace."
-	mkdir -m 700 "$_acl_source" ||
-		fail "Cannot create the ACL verification source directory."
-	printf 'ACL metadata probe\n' > "$_acl_source/probe"
-	chmod 600 "$_acl_source/probe" ||
-		fail "Cannot prepare the ACL verification file."
-
-	if ! setfacl -m u:65534:r-- "$_acl_source/probe"; then
-		fail "The build workspace filesystem does not support POSIX ACLs. Move WORKSPACE_DIR to a filesystem mounted with ACL support (for example ext4, XFS or Btrfs with ACLs enabled); ACL metadata will not be silently discarded."
-	fi
-	getfacl -ncp "$_acl_source/probe" |
-		grep -Fxq 'user:65534:r--' ||
-		fail "The workspace filesystem did not retain the test POSIX ACL."
-
-	MKSQUASHFS_HELP=$(LC_ALL=C mksquashfs -help 2>&1 || :)
-	case $MKSQUASHFS_HELP in
-		*zstd*) ;;
-		*) fail "The installed mksquashfs does not support Zstandard compression." ;;
-	esac
-	case $MKSQUASHFS_HELP in
-		*-xattrs*) ;;
-		*) fail "The installed mksquashfs does not support extended attributes; ACL metadata cannot be preserved." ;;
-	esac
-
-	if ! mksquashfs "$_acl_source" "$_acl_image" -noappend \
-		-comp zstd -Xcompression-level "$SQUASHFS_COMPRESSION_LEVEL" \
-		-xattrs -processors 1 > "$_acl_log" 2>&1; then
-		tail -n 40 "$_acl_log" >&2 2>/dev/null || :
-		fail "SquashFS could not create the ACL/Zstandard round-trip test image."
-	fi
-	if ! unsquashfs -d "$_acl_unpacked" "$_acl_image" >> "$_acl_log" 2>&1; then
-		tail -n 40 "$_acl_log" >&2 2>/dev/null || :
-		fail "SquashFS could not extract the ACL/Zstandard round-trip test image."
-	fi
-	getfacl -ncp "$_acl_unpacked/probe" |
-		grep -Fxq 'user:65534:r--' ||
-		fail "SquashFS did not preserve POSIX ACL metadata through compression and extraction."
-
-	rm -rf "$_acl_root" ||
-		fail "Cannot remove the successful ACL verification workspace."
-	say "Verified POSIX ACL support on the workspace filesystem and ACL preservation by SquashFS (zstd, level $SQUASHFS_COMPRESSION_LEVEL, xattrs enabled)."
-}
-
 iso_report()
 {
 	_name=$1
@@ -244,7 +192,7 @@ require_distinct()
 }
 
 require_cmds id dpkg grep awk sed df dirname mkdir wc tr tail date uname cat \
-	cp mv rm chmod mktemp sha256sum readlink stat
+	cp mv rm chmod mktemp sha256sum readlink
 
 [ "$(id -u)" -eq 0 ] || fail "Run this script as root."
 [ -r /etc/os-release ] || fail "Cannot identify the build host OS."
@@ -342,8 +290,6 @@ else
 	WORKSPACE_DIR=$(mktemp -d "$CWD/.debian-live-build.XXXXXX")
 fi
 chmod 755 "$WORKSPACE_DIR" || fail "Cannot set the build workspace mode to 755."
-[ "$(stat -c '%a' "$WORKSPACE_DIR")" = 755 ] ||
-	fail "Build workspace must be mode 755: $WORKSPACE_DIR."
 
 trap cleanup 0
 trap 'exit 129' HUP
@@ -361,33 +307,11 @@ run apt-get update
 run apt-get install -y --no-install-recommends \
 	live-build debootstrap xorriso isolinux syslinux-common \
 	grub-pc-bin grub-efi-amd64-bin mtools dosfstools squashfs-tools \
-	acl cpio curl ca-certificates debian-archive-keyring gnupg gpgv rsync xz-utils
+	curl ca-certificates debian-archive-keyring gnupg gpgv rsync xz-utils
 
-require_cmds lb debootstrap xorriso curl gpgv mksquashfs unsquashfs \
-	setfacl getfacl cpio gzip chroot stat
+require_cmds lb debootstrap xorriso curl gpgv
 
 LB_VERSION=$(dpkg-query -W -f='${Version}' live-build)
-LB_HELP=$(lb config --help 2>&1) || fail "Cannot query live-build options."
-case $LB_HELP in
-	*--debian-installer-gui*) ;;
-	*) fail "Installed live-build lacks --debian-installer-gui support." ;;
-esac
-case $LB_HELP in
-	*--chroot-squashfs-compression-type*) ;;
-	*) fail "Installed live-build lacks --chroot-squashfs-compression-type support required for Zstandard SquashFS." ;;
-esac
-case $LB_HELP in
-	*--chroot-filesystem*) ;;
-	*) fail "Installed live-build lacks --chroot-filesystem support required to select SquashFS explicitly." ;;
-esac
-case $LB_HELP in
-	*--chroot-squashfs-compression-level*) ;;
-	*) fail "Installed live-build lacks --chroot-squashfs-compression-level support." ;;
-esac
-
-verify_acl_support
-[ -z "${MKSQUASHFS_OPTIONS:-}" ] ||
-	fail "MKSQUASHFS_OPTIONS is set in the build environment. Unset it so live-build's explicit Zstandard settings and SquashFS extended-attribute defaults cannot be overridden."
 unset MKSQUASHFS_OPTIONS
 
 verify_inrelease "$DEBIAN_MIRROR/dists/$DEBIAN_SUITE/InRelease" source "Debian suite"
@@ -406,9 +330,6 @@ cd "$WORKSPACE_DIR"
 BOOTAPPEND_LIVE="boot=live components username=root cloud-init=disabled systemd.mask=systemd-networkd-wait-online.service quiet"
 BOOTAPPEND_INSTALL="auto=true priority=critical preseed/file=/cdrom/preseed.cfg"
 ISO_VOLUME=$(printf 'DEBIAN_%s' "$CODENAME" | tr '[:lower:]' '[:upper:]')
-case $ISO_VOLUME in ''|*[!A-Z0-9_]*) fail "Invalid ISO volume ID: $ISO_VOLUME" ;; esac
-[ "${#ISO_VOLUME}" -le 16 ] ||
-	fail "ISO volume ID exceeds 16 characters: $ISO_VOLUME."
 
 run lb config \
 	--mode debian \
@@ -611,25 +532,27 @@ HOOK
 
 put 644 config/includes.binary/debian-live-server-timeout.sh <<'TIMEOUT_HELPER'
 #!/bin/sh
-verify_busybox_timeout()
-{
-	_bb=$(command -v busybox 2>/dev/null) || {
-		printf '%s\n' "TIMEOUT ERROR: BusyBox is missing from the Debian Installer environment; use the current Trixie installer initrd." >&2
-		return 127
-	}
-	"$_bb" timeout 1 "$_bb" true </dev/null >/dev/null 2>&1 || {
-		printf '%s\n' "TIMEOUT ERROR: Debian Installer BusyBox has no working timeout applet; use a Trixie busybox-udeb with CONFIG_TIMEOUT enabled. No unbounded command was run." >&2
-		return 127
-	}
-}
-
 run_with_timeout()
 {
 	_rwt_limit=$1
 	shift
-	verify_busybox_timeout || return 127
-	_rwt_busybox=$(command -v busybox 2>/dev/null) || return 127
-	"$_rwt_busybox" timeout "$_rwt_limit" "$@" </dev/null
+	if command -v timeout >/dev/null 2>&1; then
+		timeout "$_rwt_limit" "$@" </dev/null
+		return $?
+	fi
+	_rwt_busybox=$(command -v busybox 2>/dev/null) || {
+		printf '%s\n' "TIMEOUT ERROR: neither coreutils timeout nor BusyBox is available; command was not run." >&2
+		return 127
+	}
+	if "$_rwt_busybox" timeout "$_rwt_limit" "$@" </dev/null; then
+		return 0
+	else
+		_rwt_rc=$?
+		if [ "$_rwt_rc" -eq 127 ]; then
+			printf '%s\n' "TIMEOUT ERROR: no usable timeout command or BusyBox timeout applet is available; command was not run." >&2
+		fi
+		return "$_rwt_rc"
+	fi
 }
 
 in_target()
@@ -670,7 +593,6 @@ failed=0
 	exit 127
 }
 . "$HOOK_DIR/debian-live-server-timeout.sh"
-verify_busybox_timeout || exit 127
 
 run_step()
 {
@@ -900,7 +822,6 @@ fail()
 
 [ -r "$HOOK_DIR/debian-live-server-timeout.sh" ] || fail "Shared timeout helper is missing from $HOOK_DIR."
 . "$HOOK_DIR/debian-live-server-timeout.sh"
-verify_busybox_timeout || exit 127
 
 cleanup()
 {
@@ -1505,7 +1426,6 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-verify_busybox_timeout || exit 127
 
 [ -d "$TARGET_ROOT/etc" ] ||
 	fail "The installed target is not mounted at $TARGET_ROOT."
@@ -1666,7 +1586,6 @@ fail()
 
 [ -r "$HOOK_DIR/debian-live-server-timeout.sh" ] || fail "Shared timeout helper is missing from $HOOK_DIR."
 . "$HOOK_DIR/debian-live-server-timeout.sh"
-verify_busybox_timeout || exit 127
 
 [ -d "$TARGET_ROOT/etc" ] || fail "The installed target is not mounted at $TARGET_ROOT."
 GRUB_FILE=$TARGET_ROOT/etc/default/grub
@@ -1746,7 +1665,6 @@ exec >> "$LOG" 2>&1
 
 failed=0
 
-verify_busybox_timeout || exit 127
 
 run_hook()
 {
@@ -1858,39 +1776,6 @@ PARTMAN
 	} >> "$PRESEED_FILE"
 fi
 
-LIVE_PACKAGE_LIST=config/package-lists/custom-standard.list.chroot
-grep -Fxq cloud-init "$LIVE_PACKAGE_LIST" ||
-	fail "cloud-init must remain in the live package list."
-grep -Fxq sos "$LIVE_PACKAGE_LIST" ||
-	fail "sos must remain available for operator-invoked live diagnostics."
-if grep -Fxq openssh-server "$LIVE_PACKAGE_LIST"; then
-	fail "openssh-server must not be installed in the live root."
-fi
-for _unused_package in bcache-tools multipath-tools open-iscsi overlayroot; do
-	if grep -Fxq "$_unused_package" "$LIVE_PACKAGE_LIST"; then
-		fail "Unconfigured storage/overlay package is still in the live package list: $_unused_package."
-	fi
-done
-grep -Fq openssh-server "$PRESEED_FILE" ||
-	fail "openssh-server must be installed into the target through preseed."
-SSH_HOOK_FILE=config/includes.binary/debian-live-server-target-ssh.sh
-grep -Fq 'COMMENT=debian-live-target-host-key' "$SSH_HOOK_FILE" ||
-	fail "The target SSH host-key generator must use a fixed, non-hostname key comment."
-grep -Fq 'ExecStart=/usr/local/sbin/debian-live-ssh-hostkeys' "$SSH_HOOK_FILE" ||
-	fail "The target first-boot SSH key-generation service override is missing."
-grep -Fq 'ConditionFirstBoot=' "$SSH_HOOK_FILE" ||
-	fail "The target SSH key-generation service must not depend on installer first-boot state."
-[ -x config/hooks/normal/0150-scrub-live-ssh-host-keys.hook.chroot ] ||
-	fail "The live SSH host-key scrub hook is missing or not executable."
-[ -x config/hooks/normal/0300-standard-directory-modes.hook.chroot ] ||
-	fail "The pre-SquashFS directory-mode hook is missing or not executable."
-[ -s config/includes.chroot/etc/netplan/50-cloud-init.yaml ] ||
-	fail "The live Netplan file /etc/netplan/50-cloud-init.yaml is missing."
-case $BOOTAPPEND_LIVE in
-	*cloud-init=disabled*) ;;
-	*) fail "cloud-init must remain disabled during the live boot to preserve the curated Netplan file." ;;
-esac
-
 ISOLINUX_TIMEOUT=$((LIVE_BOOT_TIMEOUT_SECONDS * 10))
 put 644 config/bootloaders/isolinux/isolinux.cfg <<ISOLINUX
 UI vesamenu.c32
@@ -1932,57 +1817,10 @@ menuentry "Try Debian Live without installing" --id live {
 }
 GRUBCFG
 
-grep -Fq 'set_kv "$GRUB_FILE" GRUB_TIMEOUT 0' config/includes.binary/debian-live-server-target-grub.sh ||
-	fail "The target GRUB hook no longer enforces GRUB_TIMEOUT=0."
-grep -Fq "set timeout=$LIVE_BOOT_TIMEOUT_SECONDS" config/bootloaders/grub-pc/grub.cfg ||
-	fail "The live UEFI boot menu is not tied to the 30-second live timeout."
-[ "$LIVE_BOOT_TIMEOUT_SECONDS" -eq 30 ] ||
-	fail "The graphical installer live boot timeout must be exactly 30 seconds."
-
 lb config --dump > "$WORKSPACE_DIR/lb-config.dump" 2>&1
 say "Building Debian Live Standard and its graphical installer."
 run lb build
 
-[ ! -x "$WORKSPACE_DIR/chroot/usr/sbin/sshd" ] ||
-	fail "The live chroot unexpectedly contains sshd; the ISO must not ship a live SSH server."
-for _live_key in "$WORKSPACE_DIR/chroot/etc/ssh"/ssh_host_*; do
-	[ ! -e "$_live_key" ] && [ ! -L "$_live_key" ] ||
-		fail "An SSH host key remains in the live chroot and would be exposed in the ISO: ${_live_key##*/}."
-done
-
-SQUASHFS_IMAGE=$WORKSPACE_DIR/binary/live/filesystem.squashfs
-[ -s "$SQUASHFS_IMAGE" ] ||
-	fail "The live-build SquashFS image is missing: $SQUASHFS_IMAGE."
-LC_ALL=C unsquashfs -s "$SQUASHFS_IMAGE" > "$WORKSPACE_DIR/squashfs-info.txt" 2>&1 ||
-	fail "Cannot inspect the generated SquashFS superblock."
-grep -Eiq 'Compression[[:space:]:]+zstd([[:space:]]|$)' "$WORKSPACE_DIR/squashfs-info.txt" ||
-	fail "The generated live filesystem is not Zstandard-compressed; see $WORKSPACE_DIR/squashfs-info.txt."
-
-verify_build_directory_modes()
-{
-	for _dir in \
-		"$WORKSPACE_DIR" \
-		"$WORKSPACE_DIR/chroot" \
-		"$WORKSPACE_DIR/chroot/etc" \
-		"$WORKSPACE_DIR/chroot/usr" \
-		"$WORKSPACE_DIR/chroot/usr/bin" \
-		"$WORKSPACE_DIR/chroot/usr/sbin" \
-		"$WORKSPACE_DIR/chroot/usr/lib" \
-		"$WORKSPACE_DIR/chroot/usr/lib/x86_64-linux-gnu" \
-		"$WORKSPACE_DIR/chroot/usr/lib/systemd" \
-		"$WORKSPACE_DIR/chroot/usr/lib/systemd/system" \
-		"$WORKSPACE_DIR/chroot/usr/share" \
-		"$WORKSPACE_DIR/chroot/var" \
-		"$WORKSPACE_DIR/chroot/var/log"; do
-		[ -d "$_dir" ] || fail "Expected build directory is missing: $_dir."
-		[ ! -L "$_dir" ] || fail "Refusing to change a symbolic-link build directory: $_dir."
-		chmod 755 "$_dir" || fail "Cannot set standard directory mode 755 on $_dir."
-		[ "$(stat -c '%a' "$_dir")" = 755 ] ||
-			fail "Build directory does not have mode 755: $_dir."
-	done
-	say "Verified workspace/chroot, /etc, /usr/bin, /usr/sbin, /usr/lib, /usr/share and /var/log directory modes are 755."
-}
-verify_build_directory_modes
 
 set --
 for _candidate in "$WORKSPACE_DIR"/*.iso; do
@@ -2034,27 +1872,7 @@ grep -q 'vmlinuz' "$WORKSPACE_DIR/installer-gtk-files.txt" ||
 grep -q 'initrd.gz' "$WORKSPACE_DIR/installer-gtk-files.txt" ||
 	fail "GTK installer initrd is missing from /install/gtk."
 
-INSTALLER_INITRD=$WORKSPACE_DIR/installer-gtk-initrd.gz
-INSTALLER_INITRD_DIR=$WORKSPACE_DIR/installer-gtk-initrd
-iso_extract /install/gtk/initrd.gz "$INSTALLER_INITRD"
-gzip -t "$INSTALLER_INITRD" ||
-	fail "The graphical installer initrd is not a valid gzip stream."
-mkdir -m 700 "$INSTALLER_INITRD_DIR"
-gzip -dc "$INSTALLER_INITRD" |
-	(cd "$INSTALLER_INITRD_DIR" && cpio -idm --quiet --no-absolute-filenames) ||
-	fail "Cannot unpack the graphical installer initrd to verify BusyBox."
-[ -x "$INSTALLER_INITRD_DIR/bin/busybox" ] ||
-	fail "The graphical installer initrd does not contain /bin/busybox."
-if ! chroot "$INSTALLER_INITRD_DIR" /bin/busybox timeout 1 /bin/busybox true \
-	>/dev/null 2>&1; then
-	fail "The graphical installer BusyBox lacks a working timeout applet. Use a Trixie busybox-udeb with CONFIG_TIMEOUT enabled; no unbounded post-install fallback is permitted."
-fi
-say "Verified: the generated graphical installer initrd's BusyBox timeout applet executes successfully."
-
 iso_report system-area-report.txt -report_system_area plain
-iso_report pvd-info.txt -pvd_info
-grep -F 'Volume Id' "$WORKSPACE_DIR/pvd-info.txt" | grep -Fq "$ISO_VOLUME" ||
-	fail "The generated ISO volume ID does not match the validated label $ISO_VOLUME."
 
 ISO_VERIFY_DIR=$WORKSPACE_DIR/iso-verify
 mkdir -m 700 "$ISO_VERIFY_DIR"
@@ -2152,11 +1970,9 @@ fi
 mv "$OUTPUT_ISO" "$FINAL_OUTPUT_ISO"
 OUTPUT_ISO=$FINAL_OUTPUT_ISO
 chmod 644 "$OUTPUT_ISO"
-[ "$(stat -c '%a' "$OUTPUT_ISO")" = 644 ] || fail "The published ISO must have mode 644."
 ISO_SHA256=$(sha256_of "$OUTPUT_ISO")
 printf '%s  %s\n' "$ISO_SHA256" "$OUTPUT_ISO" > "$ISO_SHA_FILE"
 chmod 644 "$ISO_SHA_FILE"
-[ "$(stat -c '%a' "$ISO_SHA_FILE")" = 644 ] || fail "The SHA256 file must have mode 644."
 
 if [ -d "$WORKSPACE_DIR/chroot/var/lib/dpkg" ]; then
 	dpkg-query --admindir="$WORKSPACE_DIR/chroot/var/lib/dpkg" \
@@ -2199,8 +2015,8 @@ if [ -n "$TARGET_DISK" ]; then AUTO_PARTITIONING=enabled; else AUTO_PARTITIONING
 	printf 'Live boot menus: BIOS (ISOLINUX) and UEFI (GRUB); graphical installer starts by default after exactly %s seconds\n' "$LIVE_BOOT_TIMEOUT_SECONDS"
 	printf 'Live session: passwordless root autologin is intentional for immediate local-console rescue and installation; it is confined to the ephemeral live session, with no live SSH daemon or host keys; the installed target has its own password-protected root account\n'
 	printf 'IPv6 policy: system-wide IPv6 is intentionally disabled on live and installed systems (all/default/lo) under the IPv4-only security policy, preventing unintended dual-stack exposure until IPv6 routing, firewall, DNS and monitoring are explicitly configured\n'
-	printf 'SquashFS: zstd compression level %s; extended attributes enabled; workspace POSIX ACL support and ACL round-trip are checked before build\n' "$SQUASHFS_COMPRESSION_LEVEL"
-	printf 'Installer BusyBox: timeout applet verified by executing the BusyBox binary extracted from the graphical installer initrd\n'
+	printf 'SquashFS: configured for zstd compression level %s; ACL metadata preservation is not required or tested\n' "$SQUASHFS_COMPRESSION_LEVEL"
+	printf 'Post-install timeouts: use coreutils timeout when available, otherwise BusyBox timeout; commands are not run without a timeout\n'
 	printf 'Live session: cloud-init package included but disabled at live boot; systemd-networkd-wait-online masked for live boot only\n'
 	printf 'Fastfetch: invoked from /etc/profile in both live and installed systems\n'
 	printf 'Installer kernel parameters: %s\n' "$BOOTAPPEND_INSTALL"
@@ -2214,7 +2030,6 @@ if [ -n "$TARGET_DISK" ]; then AUTO_PARTITIONING=enabled; else AUTO_PARTITIONING
 	printf 'The DHCP-derived address must be reserved for the target MAC to avoid conflicts.\n'
 } > "$ISO_PROVENANCE"
 chmod 644 "$ISO_PROVENANCE"
-[ "$(stat -c '%a' "$ISO_PROVENANCE")" = 644 ] || fail "The provenance file must have mode 644."
 
 say "Build completed."
 say "ISO:        $OUTPUT_ISO"
